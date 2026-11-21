@@ -50,6 +50,7 @@ for i in idx_known:
     ALL |= 1 << i
 # tests present at run time but unknown to the map: always safe to include when we go wide
 EXTRA_NUMS = [t["number"] for t in tests if t["id"] not in set(IDS)]
+PROBE_DROP = {num_by_id[i] for i in ("tests/test_executor.py::TestExecutor::test_execute_tpcds",) if i in num_by_id}
 
 
 def mask_to_numbers(mask):
@@ -560,6 +561,8 @@ def main():
         numbers = mask_to_numbers(mask)
         if mask == ALL:
             numbers = sorted(set(numbers) | set(EXTRA_NUMS))
+        # PROBE P2 (practice only, never the final): never select test_execute_tpcds
+        numbers = [n for n in numbers if n not in PROBE_DROP]
         out.append(json.dumps({"commit": patch.stem, "workers": assign(numbers)}))
         log(patch.stem, len(numbers))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
