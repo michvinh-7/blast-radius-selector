@@ -1,7 +1,8 @@
 """Docker build step for Fix B (build time is not scored).
 
 Extracts the pinned sqlglot/ sources from src.bin into OUT_DIR/sqlglot and computes the pinned
-TPC-DS pipeline fingerprints with this image's own Python, so runtime comparisons are exact.
+TPC-DS pipeline fingerprints and the pinned import-failure list with this image's own Python,
+so runtime comparisons are exact.
 
   python fixb_build.py APP_DIR OUT_DIR FP_JSON
 """
@@ -30,3 +31,8 @@ if again.read_bytes() != fp.read_bytes():
     sys.exit("fixb fingerprints are not deterministic")
 again.unlink()
 print(f"pinned fingerprints: {fp}", file=sys.stderr)
+# Fix A: which sqlglot modules fail to import on the pinned tree (expected: none)
+imp = fp.parent / "pinned_imports.json"
+r = subprocess.run([sys.executable, "-S", str(app / "impcheck.py"), str(out_dir)], check=True, capture_output=True, text=True)
+imp.write_text(r.stdout.strip())
+print(f"pinned import failures: {r.stdout.strip()}", file=sys.stderr)

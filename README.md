@@ -47,6 +47,23 @@ If every fingerprint matches, the test receives identical input and runs on unch
 outcome can't change, and the selector drops it. Any difference, exception, timeout or exhausted time budget
 keeps the test. This is the "run sqlglot's code while you decide" option, and its CPU time is paid for.
 
+## 3. Function signatures and import-time safety (`impcheck.py`)
+
+A `def` line runs at import, so line coverage credits it to every test that imports sqlglot. Editing a
+signature (a default value, a parameter) can only matter in two places:
+
+* At import time, if the new header can't be evaluated.
+* Inside calls to that function, which run its body.
+
+So a block that lies entirely inside a signature selects the tests that ran the function's body. That holds
+only when no function is added, removed or renamed anywhere in the file.
+
+Whenever a patch relies on that rule, or adds, removes or renames any name bound at module or class level
+(for example a deleted enum member that another module's class body refers to), the selector runs
+`impcheck.py` on a `/tmp` copy of the patched sources. It imports every `sqlglot` module and compares the
+failures with the pinned list, which is computed at Docker build time. If any module imports differently,
+every test is selected.
+
 ## Validation (not shipped)
 
 The selector was checked against synthetic mutants of the pinned commit, with ground truth from running the

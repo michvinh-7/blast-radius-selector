@@ -443,6 +443,78 @@ class PyChange:
         return m
 
 
+# ------------------------------------------------------------------ Fix A: function-signature edits
+# A def line runs at import, so coverage credits it to every importer and a signature edit used to
+# select everything. A changed default/parameter only matters (1) at import time, if the new header
+# cannot be evaluated, and (2) inside calls to that function, which run its body. So: select the
+# tests that ran the body, and verify at runtime (impcheck.py on a /tmp copy) that every sqlglot
+# module still imports exactly as on the pinned tree; if not, select everything.
+_HEADERS = {}
+NEEDS_IMPORT_CHECK = set()  # paths whose selection relied on the header rule (per commit, reset in main)
+
+
+def def_headers(path, text):
+    """[(def_line, last_header_line, body_start, end, name)] for every function in text."""
+    import ast
+
+    key = (path, hash(text))
+    if key not in _HEADERS:
+        out = []
+        for n in ast.walk(ast.parse(text)):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.body[0].lineno > n.lineno:
+                out.append((n.lineno, n.body[0].lineno - 1, n.body[0].lineno, n.end_lineno, n.name))
+        _HEADERS[key] = out
+    return _HEADERS[key]
+
+
+def defined_names(text):
+    """Multiset of names bound at module level and in class bodies (recursively), with their scope.
+    If this changes, some importer may reference a name that is gone (e.g. a deleted enum member
+    used in another module's class body), which only an import of every module can rule out."""
+    import ast
+    from collections import Counter
+
+    out = Counter()
+
+    def walk(body, scope):
+        for n in body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out[(scope, n.name)] += 1
+            elif isinstance(n, ast.ClassDef):
+                out[(scope, n.name)] += 1
+                walk(n.body, scope + "." + n.name)
+            elif isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                for t in targets:
+                    for x in ast.walk(t):
+                        if isinstance(x, ast.Name):
+                            out[(scope, x.id)] += 1
+            elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                for a in n.names:
+                    out[(scope, a.asname or a.name)] += 1
+            elif isinstance(n, (ast.If, ast.Try, ast.With)) or type(n).__name__ == "TryStar":
+                for field in ("body", "orelse", "finalbody"):
+                    walk(getattr(n, field, []) or [], scope)
+                for h in getattr(n, "handlers", []) or []:
+                    walk(h.body, scope)
+
+    walk(ast.parse(text).body, "")
+    return out
+
+
+def header_block_mask(ch, path, old_text, new_text, block):
+    """Mask for a block that lies entirely inside one function's signature, else None."""
+    lines = [ln for ln, _ in block["rem"]] or [block["pos"] - 1, block["pos"]]
+    hs = [h for h in def_headers(path, old_text) if all(h[0] <= L <= h[1] for L in lines)]
+    if not hs:
+        return None
+    # the edit must not add, remove or rename any function anywhere in the file
+    if sorted(h[4] for h in def_headers(path, old_text)) != sorted(h[4] for h in def_headers(path + "#new", new_text)):
+        return None
+    h = min(hs, key=lambda h: h[1] - h[0])
+    return ch.run_union(h[2], h[3]) | ch.col_union(h[2], h[3])
+
+
 def select_py(fd, path, blocks):
     old = read_old(path)
     if old is None:
@@ -474,9 +546,18 @@ def select_py(fd, path, blocks):
         if tc is not None and tc == old_tokens:
             blocks = [b for b in blocks if b not in cblocks]
     m = 0
+    old_text = "\n".join(old)
+    if not ch.is_test and defined_names(old_text) != defined_names(new_text):
+        NEEDS_IMPORT_CHECK.add(path)  # a module/class-level name appeared, vanished or was renamed
     for b in blocks:
         rem = b["rem"]
         add = b["add"]
+        if not ch.is_test:
+            hm = header_block_mask(ch, path, old_text, new_text, b)
+            if hm is not None:
+                NEEDS_IMPORT_CHECK.add(path)
+                m |= hm
+                continue
         for (ln, _) in rem:
             m |= ch.line_mask(ln)
         if not rem:
@@ -619,6 +700,35 @@ def fixb_same(cid, diffs):
         shutil.rmtree(td, ignore_errors=True)
 
 
+FIXB_PINNED_IMPORTS = Path(os.environ.get("FIXB_PINNED_IMPORTS", APP / "pinned_imports.json"))
+
+
+def imports_ok(cid, diffs):
+    """True only if every sqlglot module imports on the patched tree exactly as on the pinned one."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    if not (FIXB_PINNED_IMPORTS.exists() and (FIXB_PINNED_SRC / "sqlglot").is_dir()):
+        return False
+    td = Path(tempfile.mkdtemp(prefix="imp_", dir="/tmp" if Path("/tmp").is_dir() else None))
+    try:
+        shutil.copytree(FIXB_PINNED_SRC / "sqlglot", td / "sqlglot")
+        # only sqlglot/ files can change whether sqlglot modules import
+        fixb_apply(td, [fd for fd in diffs if all(p.startswith("sqlglot/") for p in (fd.old, fd.new) if p)])
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "/tmp"),
+               "PYTHONDONTWRITEBYTECODE": "1"}
+        p = subprocess.run([sys.executable, "-S", str(APP / "impcheck.py"), str(td), str(FIXB_PINNED_IMPORTS)],
+                           env=env, capture_output=True, timeout=FIXB_TIMEOUT_S)
+        log("impcheck", cid, "ok" if p.returncode == 0 else f"FAILED (exit {p.returncode}) -> all tests")
+        return p.returncode == 0
+    except Exception as e:
+        log("impcheck", cid, "error -> all tests:", repr(e)[:200])
+        return False
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def main():
     global T0
     import time
@@ -632,6 +742,7 @@ def main():
     for patch in sorted((DATA / "commits").glob("*.patch")):
         text = patch.read_text(encoding="utf-8", errors="replace")
         diffs = None
+        NEEDS_IMPORT_CHECK.clear()
         try:
             diffs = parse_patch(text)
             mask = 0
@@ -639,6 +750,8 @@ def main():
                 mask |= select_file(fd)
                 if mask == ALL:
                     break
+            if mask != ALL and NEEDS_IMPORT_CHECK and not imports_ok(patch.stem, diffs):
+                mask = ALL
         except Exception as e:  # never crash: fall back to everything
             log("fallback for", patch.stem, repr(e))
             mask = ALL
