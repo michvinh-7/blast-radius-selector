@@ -779,6 +779,7 @@ def main():
 
     out = []
     for cid, numbers, _ in rows:
+        numbers = [n for n in numbers if n != TPCDS_NUM]  # PROBE P3 (practice only, never the final)
         out.append(json.dumps({"commit": cid, "workers": assign(numbers)}))
         log(cid, len(numbers))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
