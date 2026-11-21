@@ -502,6 +502,16 @@ def defined_names(text):
     return out
 
 
+def lazy_hook_ranges(text):
+    """Line ranges of module-level __getattr__/__dir__ (PEP 562). These lazy-attribute hooks cache
+    their results in globals(), so after the first access no later test executes them: per-test
+    coverage cannot tell who depends on them. Any edit inside one selects everything."""
+    import ast
+
+    return [(n.lineno, n.end_lineno) for n in ast.parse(text).body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in ("__getattr__", "__dir__")]
+
+
 def header_block_mask(ch, path, old_text, new_text, block):
     """Mask for a block that lies entirely inside one function's signature, else None."""
     lines = [ln for ln, _ in block["rem"]] or [block["pos"] - 1, block["pos"]]
@@ -549,6 +559,12 @@ def select_py(fd, path, blocks):
     old_text = "\n".join(old)
     if not ch.is_test and defined_names(old_text) != defined_names(new_text):
         NEEDS_IMPORT_CHECK.add(path)  # a module/class-level name appeared, vanished or was renamed
+    if not ch.is_test:
+        hooks = lazy_hook_ranges(old_text)
+        for b in blocks:
+            touched = [ln for ln, _ in b["rem"]] or [b["pos"] - 1, b["pos"]]
+            if any(lo <= L <= hi for L in touched for lo, hi in hooks):
+                return ALL
     for b in blocks:
         rem = b["rem"]
         add = b["add"]
@@ -589,6 +605,14 @@ def select_other(fd, path):
 
 def select_file(fd):
     path = fd.old or fd.new
+    if fd.old and fd.new and fd.old != fd.new:
+        # a rename deletes the old path: importers/openers of the old name break
+        if fd.old.endswith(".py"):
+            if fd.old.startswith("tests/"):
+                return tests_of_file(fd.old)
+            return ALL
+        m = OPENS.get(fd.old, 0) | OPENS.get(dirname(fd.new), 0)
+        return m | select_other(fd, fd.new)
     if fd.binary:
         return OPENS.get(path, 0)
     if path.endswith(".py") and path in STRUCT and not fd.is_new:
@@ -641,7 +665,7 @@ TPCDS_NUM = num_by_id.get(TPCDS_ID)
 FIXB_PINNED_SRC = Path(os.environ.get("FIXB_PINNED_SRC", APP / "pinned"))  # pristine sqlglot/ tree
 FIXB_PINNED_FP = Path(os.environ.get("FIXB_PINNED_FP", APP / "pinned_tpcds.json"))
 FIXB_DATA = APP / "fixb_tpcds.json"
-FIXB_MIN_SAVING_MS = 6000  # only check when dropping the test saves clearly more than the check costs
+FIXB_MIN_SAVING_MS = 10000  # a full check costs ~6.5 s CPU on the scorer (board: +7 s CPU at 6 s threshold)
 FIXB_TIMEOUT_S = 40
 FIXB_BUDGET_S = 100  # stop starting new checks this far into the run (limit: 180 s practice, 270 s final)
 T0 = None
@@ -710,6 +734,7 @@ def imports_ok(cid, diffs):
     import tempfile
 
     if not (FIXB_PINNED_IMPORTS.exists() and (FIXB_PINNED_SRC / "sqlglot").is_dir()):
+        log("!!! impcheck disabled: pinned data missing -> all tests !!!")
         return False
     td = Path(tempfile.mkdtemp(prefix="imp_", dir="/tmp" if Path("/tmp").is_dir() else None))
     try:
@@ -737,7 +762,8 @@ def main():
     T0 = time.time()
     fixb_ready = TPCDS_NUM is not None and FIXB_PINNED_FP.exists() and (FIXB_PINNED_SRC / "sqlglot").is_dir()
     if not fixb_ready:
-        log("fixb disabled: pinned data missing")
+        # never crash in the scorer (a crash rejects the run), but make it impossible to miss in gates
+        log("!!! fixb disabled: pinned data missing at", FIXB_PINNED_FP, "/", FIXB_PINNED_SRC, "!!!")
     rows = []  # (commit, numbers, diffs or None)
     for patch in sorted((DATA / "commits").glob("*.patch")):
         text = patch.read_text(encoding="utf-8", errors="replace")
