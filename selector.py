@@ -543,10 +543,95 @@ def assign(numbers):
     return [g for g in best[1] if g]
 
 
+def cost_ms(numbers):
+    groups = assign(numbers)
+    return max(sum(dur_ms[n] for n in g) for g in groups) + WORKER_MS * len(groups) if groups else 0
+
+
+# ------------------------------------------------------------------ Fix B: TPC-DS pipeline check
+# test_execute_tpcds (~21.5 s) runs every TPC-DS query through parse -> pickle -> optimize -> plan
+# -> generated Python -> execute, and compares with duckdb on transpile(sql, "duckdb"). If a patch
+# leaves everything before execution byte-identical for all queries, and touches no execution-time
+# code (sqlglot/executor/) and nothing outside sqlglot/, the test sees identical input on identical
+# executor code, so it cannot change outcome. fixb.py checks this on a /tmp copy of the patched
+# sources; any error, difference or timeout keeps the test.
+TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+TPCDS_NUM = num_by_id.get(TPCDS_ID)
+FIXB_PINNED_SRC = Path(os.environ.get("FIXB_PINNED_SRC", APP / "pinned"))  # pristine sqlglot/ tree
+FIXB_PINNED_FP = Path(os.environ.get("FIXB_PINNED_FP", APP / "pinned_tpcds.json"))
+FIXB_DATA = APP / "fixb_tpcds.json"
+FIXB_MIN_SAVING_MS = 6000  # only check when dropping the test saves clearly more than the check costs
+FIXB_TIMEOUT_S = 40
+FIXB_BUDGET_S = 100  # stop starting new checks this far into the run (limit: 180 s practice, 270 s final)
+T0 = None
+
+
+def fixb_eligible(diffs):
+    paths = set()
+    for fd in diffs:
+        for p in (fd.old, fd.new):
+            if p:
+                paths.add(p)
+    return bool(paths) and all(p.startswith("sqlglot/") and not p.startswith("sqlglot/executor/") for p in paths)
+
+
+def fixb_apply(root, diffs):
+    for fd in diffs:
+        if fd.binary:
+            raise ValueError("binary")
+        old_p = root / fd.old if fd.old else None
+        new_p = root / fd.new if fd.new else None
+        if fd.is_deleted:
+            old_p.unlink()
+            continue
+        old_lines = [] if fd.is_new else old_p.read_text(encoding="utf-8").split("\n")
+        text = apply_blocks(old_lines, fd.hunks)
+        new_p.parent.mkdir(parents=True, exist_ok=True)
+        new_p.write_text(text, encoding="utf-8")
+        if fd.old and fd.new and fd.old != fd.new:
+            old_p.unlink()
+
+
+def fixb_same(cid, diffs):
+    """True only if fixb.py proves the TPC-DS pipeline output is unchanged."""
+    import shutil
+    import subprocess
+    import tempfile
+    import time
+
+    if time.time() - T0 > FIXB_BUDGET_S:
+        log("fixb", cid, "skipped: time budget")
+        return False
+    td = Path(tempfile.mkdtemp(prefix="fixb_", dir="/tmp" if Path("/tmp").is_dir() else None))
+    try:
+        shutil.copytree(FIXB_PINNED_SRC / "sqlglot", td / "sqlglot")
+        fixb_apply(td, diffs)
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "/tmp"),
+               "PYTHONDONTWRITEBYTECODE": "1"}
+        p = subprocess.run([sys.executable, "-S", str(APP / "fixb.py"), str(td), str(FIXB_DATA), "-", str(FIXB_PINNED_FP)],
+                           env=env, capture_output=True, timeout=FIXB_TIMEOUT_S)
+        log("fixb", cid, "SAME" if p.returncode == 0 else f"keep (exit {p.returncode})")
+        return p.returncode == 0
+    except Exception as e:  # anything unexpected: keep the test
+        log("fixb", cid, "keep:", repr(e)[:200])
+        return False
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def main():
-    out = []
+    global T0
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    T0 = time.time()
+    fixb_ready = TPCDS_NUM is not None and FIXB_PINNED_FP.exists() and (FIXB_PINNED_SRC / "sqlglot").is_dir()
+    if not fixb_ready:
+        log("fixb disabled: pinned data missing")
+    rows = []  # (commit, numbers, diffs or None)
     for patch in sorted((DATA / "commits").glob("*.patch")):
         text = patch.read_text(encoding="utf-8", errors="replace")
+        diffs = None
         try:
             diffs = parse_patch(text)
             mask = 0
@@ -557,11 +642,32 @@ def main():
         except Exception as e:  # never crash: fall back to everything
             log("fallback for", patch.stem, repr(e))
             mask = ALL
+            diffs = None
         numbers = mask_to_numbers(mask)
         if mask == ALL:
             numbers = sorted(set(numbers) | set(EXTRA_NUMS))
-        out.append(json.dumps({"commit": patch.stem, "workers": assign(numbers)}))
-        log(patch.stem, len(numbers))
+        rows.append((patch.stem, numbers, diffs))
+
+    checks = []
+    if fixb_ready:
+        for i, (cid, numbers, diffs) in enumerate(rows):
+            if diffs is None or TPCDS_NUM not in numbers or not fixb_eligible(diffs):
+                continue
+            without = [n for n in numbers if n != TPCDS_NUM]
+            if cost_ms(numbers) - cost_ms(without) > FIXB_MIN_SAVING_MS:
+                checks.append(i)
+    if checks:
+        with ThreadPoolExecutor(2) as ex:
+            same = list(ex.map(lambda i: fixb_same(rows[i][0], rows[i][2]), checks))
+        for i, ok in zip(checks, same):
+            if ok:
+                cid, numbers, diffs = rows[i]
+                rows[i] = (cid, [n for n in numbers if n != TPCDS_NUM], diffs)
+
+    out = []
+    for cid, numbers, _ in rows:
+        out.append(json.dumps({"commit": cid, "workers": assign(numbers)}))
+        log(cid, len(numbers))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
 
 
