@@ -443,6 +443,78 @@ class PyChange:
         return m
 
 
+# ------------------------------------------------------------------ Fix A: function-signature edits
+# A def line runs at import, so coverage credits it to every importer and a signature edit used to
+# select everything. A changed default/parameter only matters (1) at import time, if the new header
+# cannot be evaluated, and (2) inside calls to that function, which run its body. So: select the
+# tests that ran the body, and verify at runtime (impcheck.py on a /tmp copy) that every sqlglot
+# module still imports exactly as on the pinned tree; if not, select everything.
+_HEADERS = {}
+NEEDS_IMPORT_CHECK = set()  # paths whose selection relied on the header rule (per commit, reset in main)
+
+
+def def_headers(path, text):
+    """[(def_line, last_header_line, body_start, end, name)] for every function in text."""
+    import ast
+
+    key = (path, hash(text))
+    if key not in _HEADERS:
+        out = []
+        for n in ast.walk(ast.parse(text)):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.body[0].lineno > n.lineno:
+                out.append((n.lineno, n.body[0].lineno - 1, n.body[0].lineno, n.end_lineno, n.name))
+        _HEADERS[key] = out
+    return _HEADERS[key]
+
+
+def defined_names(text):
+    """Multiset of names bound at module level and in class bodies (recursively), with their scope.
+    If this changes, some importer may reference a name that is gone (e.g. a deleted enum member
+    used in another module's class body), which only an import of every module can rule out."""
+    import ast
+    from collections import Counter
+
+    out = Counter()
+
+    def walk(body, scope):
+        for n in body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out[(scope, n.name)] += 1
+            elif isinstance(n, ast.ClassDef):
+                out[(scope, n.name)] += 1
+                walk(n.body, scope + "." + n.name)
+            elif isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                for t in targets:
+                    for x in ast.walk(t):
+                        if isinstance(x, ast.Name):
+                            out[(scope, x.id)] += 1
+            elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                for a in n.names:
+                    out[(scope, a.asname or a.name)] += 1
+            elif isinstance(n, (ast.If, ast.Try, ast.With)) or type(n).__name__ == "TryStar":
+                for field in ("body", "orelse", "finalbody"):
+                    walk(getattr(n, field, []) or [], scope)
+                for h in getattr(n, "handlers", []) or []:
+                    walk(h.body, scope)
+
+    walk(ast.parse(text).body, "")
+    return out
+
+
+def header_block_mask(ch, path, old_text, new_text, block):
+    """Mask for a block that lies entirely inside one function's signature, else None."""
+    lines = [ln for ln, _ in block["rem"]] or [block["pos"] - 1, block["pos"]]
+    hs = [h for h in def_headers(path, old_text) if all(h[0] <= L <= h[1] for L in lines)]
+    if not hs:
+        return None
+    # the edit must not add, remove or rename any function anywhere in the file
+    if sorted(h[4] for h in def_headers(path, old_text)) != sorted(h[4] for h in def_headers(path + "#new", new_text)):
+        return None
+    h = min(hs, key=lambda h: h[1] - h[0])
+    return ch.run_union(h[2], h[3]) | ch.col_union(h[2], h[3])
+
+
 def select_py(fd, path, blocks):
     old = read_old(path)
     if old is None:
@@ -474,9 +546,18 @@ def select_py(fd, path, blocks):
         if tc is not None and tc == old_tokens:
             blocks = [b for b in blocks if b not in cblocks]
     m = 0
+    old_text = "\n".join(old)
+    if not ch.is_test and defined_names(old_text) != defined_names(new_text):
+        NEEDS_IMPORT_CHECK.add(path)  # a module/class-level name appeared, vanished or was renamed
     for b in blocks:
         rem = b["rem"]
         add = b["add"]
+        if not ch.is_test:
+            hm = header_block_mask(ch, path, old_text, new_text, b)
+            if hm is not None:
+                NEEDS_IMPORT_CHECK.add(path)
+                m |= hm
+                continue
         for (ln, _) in rem:
             m |= ch.line_mask(ln)
         if not rem:
@@ -543,10 +624,125 @@ def assign(numbers):
     return [g for g in best[1] if g]
 
 
+def cost_ms(numbers):
+    groups = assign(numbers)
+    return max(sum(dur_ms[n] for n in g) for g in groups) + WORKER_MS * len(groups) if groups else 0
+
+
+# ------------------------------------------------------------------ Fix B: TPC-DS pipeline check
+# test_execute_tpcds (~21.5 s) runs every TPC-DS query through parse -> pickle -> optimize -> plan
+# -> generated Python -> execute, and compares with duckdb on transpile(sql, "duckdb"). If a patch
+# leaves everything before execution byte-identical for all queries, and touches no execution-time
+# code (sqlglot/executor/) and nothing outside sqlglot/, the test sees identical input on identical
+# executor code, so it cannot change outcome. fixb.py checks this on a /tmp copy of the patched
+# sources; any error, difference or timeout keeps the test.
+TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+TPCDS_NUM = num_by_id.get(TPCDS_ID)
+FIXB_PINNED_SRC = Path(os.environ.get("FIXB_PINNED_SRC", APP / "pinned"))  # pristine sqlglot/ tree
+FIXB_PINNED_FP = Path(os.environ.get("FIXB_PINNED_FP", APP / "pinned_tpcds.json"))
+FIXB_DATA = APP / "fixb_tpcds.json"
+FIXB_MIN_SAVING_MS = 6000  # only check when dropping the test saves clearly more than the check costs
+FIXB_TIMEOUT_S = 40
+FIXB_BUDGET_S = 100  # stop starting new checks this far into the run (limit: 180 s practice, 270 s final)
+T0 = None
+
+
+def fixb_eligible(diffs):
+    paths = set()
+    for fd in diffs:
+        for p in (fd.old, fd.new):
+            if p:
+                paths.add(p)
+    return bool(paths) and all(p.startswith("sqlglot/") and not p.startswith("sqlglot/executor/") for p in paths)
+
+
+def fixb_apply(root, diffs):
+    for fd in diffs:
+        if fd.binary:
+            raise ValueError("binary")
+        old_p = root / fd.old if fd.old else None
+        new_p = root / fd.new if fd.new else None
+        if fd.is_deleted:
+            old_p.unlink()
+            continue
+        old_lines = [] if fd.is_new else old_p.read_text(encoding="utf-8").split("\n")
+        text = apply_blocks(old_lines, fd.hunks)
+        new_p.parent.mkdir(parents=True, exist_ok=True)
+        new_p.write_text(text, encoding="utf-8")
+        if fd.old and fd.new and fd.old != fd.new:
+            old_p.unlink()
+
+
+def fixb_same(cid, diffs):
+    """True only if fixb.py proves the TPC-DS pipeline output is unchanged."""
+    import shutil
+    import subprocess
+    import tempfile
+    import time
+
+    if time.time() - T0 > FIXB_BUDGET_S:
+        log("fixb", cid, "skipped: time budget")
+        return False
+    td = Path(tempfile.mkdtemp(prefix="fixb_", dir="/tmp" if Path("/tmp").is_dir() else None))
+    try:
+        shutil.copytree(FIXB_PINNED_SRC / "sqlglot", td / "sqlglot")
+        fixb_apply(td, diffs)
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "/tmp"),
+               "PYTHONDONTWRITEBYTECODE": "1"}
+        p = subprocess.run([sys.executable, "-S", str(APP / "fixb.py"), str(td), str(FIXB_DATA), "-", str(FIXB_PINNED_FP)],
+                           env=env, capture_output=True, timeout=FIXB_TIMEOUT_S)
+        log("fixb", cid, "SAME" if p.returncode == 0 else f"keep (exit {p.returncode})")
+        return p.returncode == 0
+    except Exception as e:  # anything unexpected: keep the test
+        log("fixb", cid, "keep:", repr(e)[:200])
+        return False
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+FIXB_PINNED_IMPORTS = Path(os.environ.get("FIXB_PINNED_IMPORTS", APP / "pinned_imports.json"))
+
+
+def imports_ok(cid, diffs):
+    """True only if every sqlglot module imports on the patched tree exactly as on the pinned one."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    if not (FIXB_PINNED_IMPORTS.exists() and (FIXB_PINNED_SRC / "sqlglot").is_dir()):
+        return False
+    td = Path(tempfile.mkdtemp(prefix="imp_", dir="/tmp" if Path("/tmp").is_dir() else None))
+    try:
+        shutil.copytree(FIXB_PINNED_SRC / "sqlglot", td / "sqlglot")
+        # only sqlglot/ files can change whether sqlglot modules import
+        fixb_apply(td, [fd for fd in diffs if all(p.startswith("sqlglot/") for p in (fd.old, fd.new) if p)])
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "/tmp"),
+               "PYTHONDONTWRITEBYTECODE": "1"}
+        p = subprocess.run([sys.executable, "-S", str(APP / "impcheck.py"), str(td), str(FIXB_PINNED_IMPORTS)],
+                           env=env, capture_output=True, timeout=FIXB_TIMEOUT_S)
+        log("impcheck", cid, "ok" if p.returncode == 0 else f"FAILED (exit {p.returncode}) -> all tests")
+        return p.returncode == 0
+    except Exception as e:
+        log("impcheck", cid, "error -> all tests:", repr(e)[:200])
+        return False
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def main():
-    out = []
+    global T0
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    T0 = time.time()
+    fixb_ready = TPCDS_NUM is not None and FIXB_PINNED_FP.exists() and (FIXB_PINNED_SRC / "sqlglot").is_dir()
+    if not fixb_ready:
+        log("fixb disabled: pinned data missing")
+    rows = []  # (commit, numbers, diffs or None)
     for patch in sorted((DATA / "commits").glob("*.patch")):
         text = patch.read_text(encoding="utf-8", errors="replace")
+        diffs = None
+        NEEDS_IMPORT_CHECK.clear()
         try:
             diffs = parse_patch(text)
             mask = 0
@@ -554,14 +750,37 @@ def main():
                 mask |= select_file(fd)
                 if mask == ALL:
                     break
+            if mask != ALL and NEEDS_IMPORT_CHECK and not imports_ok(patch.stem, diffs):
+                mask = ALL
         except Exception as e:  # never crash: fall back to everything
             log("fallback for", patch.stem, repr(e))
             mask = ALL
+            diffs = None
         numbers = mask_to_numbers(mask)
         if mask == ALL:
             numbers = sorted(set(numbers) | set(EXTRA_NUMS))
-        out.append(json.dumps({"commit": patch.stem, "workers": assign(numbers)}))
-        log(patch.stem, len(numbers))
+        rows.append((patch.stem, numbers, diffs))
+
+    checks = []
+    if fixb_ready:
+        for i, (cid, numbers, diffs) in enumerate(rows):
+            if diffs is None or TPCDS_NUM not in numbers or not fixb_eligible(diffs):
+                continue
+            without = [n for n in numbers if n != TPCDS_NUM]
+            if cost_ms(numbers) - cost_ms(without) > FIXB_MIN_SAVING_MS:
+                checks.append(i)
+    if checks:
+        with ThreadPoolExecutor(2) as ex:
+            same = list(ex.map(lambda i: fixb_same(rows[i][0], rows[i][2]), checks))
+        for i, ok in zip(checks, same):
+            if ok:
+                cid, numbers, diffs = rows[i]
+                rows[i] = (cid, [n for n in numbers if n != TPCDS_NUM], diffs)
+
+    out = []
+    for cid, numbers, _ in rows:
+        out.append(json.dumps({"commit": cid, "workers": assign(numbers)}))
+        log(cid, len(numbers))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
 
 

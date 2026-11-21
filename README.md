@@ -1,17 +1,79 @@
 # Blast Radius entry
 
-`selector.py` picks, for each sqlglot patch, the tests that can catch it and splits them over workers.
-Nothing is run at decision time; it reads two precomputed files built from the pinned sqlglot commit
-(eb11aec4be8cb2122afe713a4816662c3f0fb2fa):
+`selector.py` picks, for each sqlglot patch, the tests that can catch it, and splits them over workers.
+Everything it knows comes from the pinned sqlglot commit (eb11aec4be8cb2122afe713a4816662c3f0fb2fa).
+Nothing is looked up by patch or by kind of edit: no table maps an edit to the tests it breaks.
 
-* `map.bin` – per-test line coverage (each test run alone in its own process, including spawned pool
-  workers), which fixture files each test reads, which sqlglot classes each test instantiates, source structure.
-* `src.bin` – snapshot of the pinned `sqlglot/` and `tests/` python files (used to apply a patch and
-  compare token streams; no network is needed).
+## 1. Static selection from a coverage map
 
-Rules: comment/whitespace-only changes run nothing; fixture edits run the tests that read the fixture;
-code edits run tests that executed the changed statement; class-level constants run tests that instantiated
-the class (and read the attribute); syntax errors and unknown cases fall back to wider sets.
+Two files are precomputed from the pinned commit:
 
-Rebuild: see `tools/` (`iso_plugin.py` runs each test in a forked child with coverage, `classhook.py`
-records instantiated classes, `build_map.py` assembles `map.bin` and `src.bin`).
+* `map.bin` holds the following, all from the pinned commit:
+  * Per-test line coverage. Each test runs alone in its own process, including spawned pool workers.
+  * Which fixture files each test reads.
+  * Which sqlglot classes each test instantiates.
+  * The source structure: statements, functions and classes.
+* `src.bin` is a snapshot of the pinned `sqlglot/` and `tests/` Python files. It's used to apply a patch
+  and compare token streams, so no network is needed.
+
+The rules:
+
+* Comment- or whitespace-only changes, with an identical token stream, run nothing.
+* Fixture edits run the tests that read the fixture.
+* Code edits run the tests that executed the changed statement.
+* Class-level constants run the tests that instantiated the class and read the attribute.
+* Syntax errors and unknown cases fall back to wider sets.
+
+## 2. Runtime check for `test_execute_tpcds` (`fixb.py`)
+
+`test_execute_tpcds` takes about 21.5 s, and its coverage reaches most of the parser, optimizer and planner.
+That makes it the most expensive test to select needlessly. The test:
+
+1. Parses each TPC-DS query and pickles it to a pool worker.
+2. Optimizes it against the schema.
+3. Plans it, compiles the plan's expressions to Python and executes them.
+4. Compares the result with duckdb running `transpile(sql, write="duckdb")`.
+
+When a patch touches only `sqlglot/` and not `sqlglot/executor/`, and dropping the test would save more than
+6 s, the selector checks whether it can drop the test:
+
+* It writes the patched sources to `/tmp`.
+* `fixb.py` rebuilds everything before execution for all 57 executed queries: the pickle round-trip AST, the
+  optimized AST, the plan steps with their generated Python, and the duckdb SQL.
+* It hashes each query's result and compares it with the pinned fingerprints. Those are computed by
+  `fixb_build.py` during the Docker build, with the same Python.
+
+If every fingerprint matches, the test receives identical input and runs on unchanged executor code, so its
+outcome can't change, and the selector drops it. Any difference, exception, timeout or exhausted time budget
+keeps the test. This is the "run sqlglot's code while you decide" option, and its CPU time is paid for.
+
+## 3. Function signatures and import-time safety (`impcheck.py`)
+
+A `def` line runs at import, so line coverage credits it to every test that imports sqlglot. Editing a
+signature (a default value, a parameter) can only matter in two places:
+
+* At import time, if the new header can't be evaluated.
+* Inside calls to that function, which run its body.
+
+So a block that lies entirely inside a signature selects the tests that ran the function's body. That holds
+only when no function is added, removed or renamed anywhere in the file.
+
+Whenever a patch relies on that rule, or adds, removes or renames any name bound at module or class level
+(for example a deleted enum member that another module's class body refers to), the selector runs
+`impcheck.py` on a `/tmp` copy of the patched sources. It imports every `sqlglot` module and compares the
+failures with the pinned list, which is computed at Docker build time. If any module imports differently,
+every test is selected.
+
+## Validation (not shipped)
+
+The selector was checked against synthetic mutants of the pinned commit, with ground truth from running the
+full test suite on each. Those mutants and results live outside this repository and are never consulted at
+runtime.
+
+## Rebuilding the map
+
+See `tools/`:
+
+* `iso_plugin.py` runs each test in a forked child with coverage.
+* `classhook.py` records instantiated classes.
+* `build_map.py` assembles `map.bin` and `src.bin`.
