@@ -205,6 +205,21 @@ COMMENTISH = re.compile(r"^\s*(#.*)?$")
 CODING = re.compile(r"coding[:=]")
 
 
+_OLD_CACHE = {}
+
+
+def _old_cached(kind, path, text, fn):
+    """fn(text) for a pinned file's text, computed once per run (many commits touch the same file).
+    Keyed by the full text, so a different text can never reuse a result. Results are read-only."""
+    key = (kind, path)
+    hit = _OLD_CACHE.get(key)
+    if hit is not None and hit[0] == text:
+        return hit[1]
+    v = fn(text)
+    _OLD_CACHE[key] = (text, v)
+    return v
+
+
 def sem_tokens(text):
     out = []
     try:
@@ -548,9 +563,9 @@ def select_py(fd, path, blocks):
         if ch.is_test_module:
             return tests_of_file(path)
         return ALL
-    old_tokens = None
+    old_text = "\n".join(old)
     new_tokens = sem_tokens(new_text)
-    old_tokens = sem_tokens("\n".join(old))
+    old_tokens = _old_cached("tok", path, old_text, sem_tokens)
     if old_tokens is not None and new_tokens is not None and old_tokens == new_tokens:
         return 0
     if VM["enabled"] and not ch.is_test and path.startswith("sqlglot/") and _may_touch_comparison(blocks):
@@ -571,11 +586,10 @@ def select_py(fd, path, blocks):
         if tc is not None and tc == old_tokens:
             blocks = [b for b in blocks if b not in cblocks]
     m = 0
-    old_text = "\n".join(old)
-    if not ch.is_test and defined_names(old_text) != defined_names(new_text):
+    if not ch.is_test and _old_cached("names", path, old_text, defined_names) != defined_names(new_text):
         NEEDS_IMPORT_CHECK.add(path)  # a module/class-level name appeared, vanished or was renamed
     if not ch.is_test:
-        hooks = lazy_hook_ranges(old_text)
+        hooks = _old_cached("hooks", path, old_text, lazy_hook_ranges)
         for b in blocks:
             touched = [ln for ln, _ in b["rem"]] or [b["pos"] - 1, b["pos"]]
             if any(lo <= L <= hi for L in touched for lo, hi in hooks):
