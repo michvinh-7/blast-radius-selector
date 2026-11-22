@@ -606,7 +606,10 @@ def select_other(fd, path):
     if path.startswith("sqlglotc/"):
         m |= tests_of_file("tests/test_sqlglotc.py")
     if base in ("pyproject.toml", "setup.py", "setup.cfg", "tox.ini", "pytest.ini", "conftest.py", "requirements.lock"):
-        m |= ALL if base in ("pytest.ini", "conftest.py", "tox.ini") else tests_of_file("tests/test_sqlglotc.py")
+        # pytest reads setup.cfg / pyproject.toml / tox.ini / pytest.ini / conftest.py at startup: an edit
+        # can make the whole run error (e.g. a duplicate key in setup.cfg fails every test)
+        startup = ("pytest.ini", "conftest.py", "tox.ini", "setup.cfg", "pyproject.toml")
+        m |= ALL if base in startup else tests_of_file("tests/test_sqlglotc.py")
     return m
 
 
