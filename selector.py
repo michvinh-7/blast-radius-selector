@@ -1062,6 +1062,39 @@ def genmem_cold_ok(cid, diffs):
         shutil.rmtree(td, ignore_errors=True)
 
 
+def _p15_tokconst_only(diffs):
+    """PROBE P15 (practice only, never final): every changed line is inside a class-level
+    assignment of a Tokenizer class (KEYWORDS, escapes, quotes...)."""
+    import ast
+
+    if not diffs:
+        return False
+    for fd in diffs:
+        if fd.is_new or fd.is_deleted or fd.binary or fd.old != fd.new or not fd.old.startswith("sqlglot/") \
+                or not fd.old.endswith(".py"):
+            return False
+        old = read_old(fd.old)
+        if old is None:
+            return False
+        try:
+            tree = ast.parse("\n".join(old))
+            ast.parse(apply_blocks(old, fd.hunks))
+        except SyntaxError:
+            return False
+        ranges = []
+        for c in ast.walk(tree):
+            if isinstance(c, ast.ClassDef) and (c.name == "Tokenizer" or any(
+                    (getattr(b, "id", None) or getattr(b, "attr", "")).endswith("Tokenizer") for b in c.bases)):
+                ranges += [(s.lineno, s.end_lineno) for s in c.body if isinstance(s, (ast.Assign, ast.AnnAssign))]
+        if not fd.hunks:
+            return False
+        for b in fd.hunks:
+            lines = [ln for ln, _ in b["rem"]] or [b["pos"] - 1, b["pos"]]
+            if not any(all(lo <= L <= hi for L in lines) for lo, hi in ranges):
+                return False
+    return True
+
+
 def main():
     global T0
     import time
@@ -1133,7 +1166,10 @@ def main():
                     rows[i] = (cid, [n for n in numbers if n != GENMEM_NUM], diffs)
 
     out = []
-    for cid, numbers, _ in rows:
+    for cid, numbers, _diffs in rows:
+        if _diffs is not None and _p15_tokconst_only(_diffs):  # PROBE P15 (practice only, never final)
+            log("P15 drop-all", cid)
+            numbers = []
         out.append(json.dumps({"commit": cid, "workers": assign(numbers)}))
         log(cid, len(numbers))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
