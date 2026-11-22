@@ -688,6 +688,50 @@ def _stmt_lists(tree):
             yield c, "body", c.body
 
 
+def _overlap_walk(tree, n0, n1):
+    """ast.walk order (breadth-first), restricted to nodes whose line span (decorators included)
+    overlaps [n0, n1] or that carry no line info, plus a parent map for every enqueued node. A
+    statement list outside the region cannot contain statements inside [n0, n1], so the lists this
+    yields are exactly those of the full walk that can matter, in the same relative order."""
+    from collections import deque
+
+    def overlaps(n):
+        lo = getattr(n, "lineno", None)
+        hi = getattr(n, "end_lineno", None)
+        if lo is None or hi is None:
+            return True
+        for d in getattr(n, "decorator_list", None) or []:
+            lo = min(lo, d.lineno)
+        return not (hi < n0 or lo > n1)
+
+    import ast
+
+    order, parents = [], {}
+    todo = deque([tree])
+    while todo:
+        n = todo.popleft()
+        order.append(n)
+        for c in ast.iter_child_nodes(n):
+            if overlaps(c):
+                parents[id(c)] = n
+                todo.append(c)
+    return order, parents
+
+
+def _lists_of(nodes):
+    import ast
+
+    for node in nodes:
+        for field in ("body", "orelse", "finalbody"):
+            lst = getattr(node, field, None)
+            if isinstance(lst, list) and lst and isinstance(lst[0], ast.stmt):
+                yield node, field, lst
+        for h in getattr(node, "handlers", None) or []:
+            yield h, "body", h.body
+        for c in getattr(node, "cases", None) or []:
+            yield c, "body", c.body
+
+
 def _start(st):
     return min([st.lineno] + [d.lineno for d in getattr(st, "decorator_list", [])])
 
@@ -762,7 +806,8 @@ def narrow_insertion(ch, path, old, new_text, blocks, b):
         return None
     # the inserted code lines must be exactly a run of whole statements of one statement list
     found = None
-    for owner, field, lst in _stmt_lists(tree):
+    order, parents = _overlap_walk(tree, n0, n1)
+    for owner, field, lst in _lists_of(order):
         idx = [i for i, st in enumerate(lst) if n0 <= _start(st) and st.end_lineno <= n1]
         if not idx:
             continue
@@ -779,11 +824,7 @@ def narrow_insertion(ch, path, old, new_text, blocks, b):
         return None
     owner, field, lst, i, j = found
     ins = lst[i:j + 1]
-    # nearest enclosing scope of the statement list
-    parents = {}
-    for n in ast.walk(tree):
-        for c in ast.iter_child_nodes(n):
-            parents[id(c)] = n
+    # nearest enclosing scope of the statement list (its ancestors all overlap the insertion)
     scope = owner
     while not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module, ast.Lambda)):
         scope = parents.get(id(scope))
