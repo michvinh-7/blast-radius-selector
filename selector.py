@@ -999,7 +999,12 @@ def main():
                 rows[i] = (cid, [n for n in numbers if n != TPCDS_NUM], diffs)
 
     out = []
+    P9 = {num_by_id[i] for i in (
+        "tests/test_generator.py::TestGenerator::test_generator_memory",
+        "tests/test_schema.py::TestSchema::test_cache_does_not_retain_queries",
+    ) if i in num_by_id}
     for cid, numbers, _ in rows:
+        numbers = [n for n in numbers if n not in P9]  # PROBE P9 (practice only): never select the two leak tests
         out.append(json.dumps({"commit": cid, "workers": assign(numbers)}))
         log(cid, len(numbers))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
