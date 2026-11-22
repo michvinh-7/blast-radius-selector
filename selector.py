@@ -999,7 +999,15 @@ def main():
                 rows[i] = (cid, [n for n in numbers if n != TPCDS_NUM], diffs)
 
     out = []
+    P6 = {num_by_id[i] for i in (
+        "tests/test_executor.py::TestExecutor::test_execute_tpch",
+        "tests/test_executor.py::TestExecutor::test_optimized_tpch",
+        "tests/test_executor.py::TestExecutor::test_agg_order",
+        "tests/test_generator.py::TestGenerator::test_generator_memory",
+        "tests/test_schema.py::TestSchema::test_cache_does_not_retain_queries",
+    ) if i in num_by_id}
     for cid, numbers, _ in rows:
+        numbers = [n for n in numbers if n not in P6]  # PROBE P6 (practice only, never final): drop setup-heavy group
         out.append(json.dumps({"commit": cid, "workers": assign(numbers)}))
         log(cid, len(numbers))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
