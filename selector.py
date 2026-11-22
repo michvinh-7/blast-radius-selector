@@ -545,6 +545,13 @@ def select_py(fd, path, blocks):
     old_tokens = sem_tokens("\n".join(old))
     if old_tokens is not None and new_tokens is not None and old_tokens == new_tokens:
         return 0
+    if VM["enabled"] and not ch.is_test and path.startswith("sqlglot/"):
+        import valuemap
+
+        if valuemap.file_equivalent(VALUEMAP_PATH, path, "\n".join(old), new_text):
+            VM["used"] = True
+            log("valuemap", path, "comparison change proven result-preserving on all recorded inputs")
+            return 0
     # comment-only blocks
     cblocks = [
         b
@@ -660,6 +667,12 @@ def cost_ms(numbers):
 # code (sqlglot/executor/) and nothing outside sqlglot/, the test sees identical input on identical
 # executor code, so it cannot change outcome. fixb.py checks this on a /tmp copy of the patched
 # sources; any error, difference or timeout keeps the test.
+# Value-profile check (valuemap.py): a patch whose only changes are comparisons that return the same
+# result on every input the pinned suite fed them cannot change any test. Valid only if EVERY changed
+# file is proven this way (otherwise other changes could feed the comparisons new values).
+VALUEMAP_PATH = APP / "cmpmap.bin"
+VM = {"enabled": True, "used": False}
+
 TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 TPCDS_NUM = num_by_id.get(TPCDS_ID)
 FIXB_PINNED_SRC = Path(os.environ.get("FIXB_PINNED_SRC", APP / "pinned"))  # pristine sqlglot/ tree
@@ -768,14 +781,22 @@ def main():
     for patch in sorted((DATA / "commits").glob("*.patch")):
         text = patch.read_text(encoding="utf-8", errors="replace")
         diffs = None
-        NEEDS_IMPORT_CHECK.clear()
         try:
             diffs = parse_patch(text)
-            mask = 0
-            for fd in diffs:
-                mask |= select_file(fd)
-                if mask == ALL:
+            for attempt in (1, 2):
+                VM["enabled"], VM["used"] = attempt == 1, False
+                NEEDS_IMPORT_CHECK.clear()
+                mask = 0
+                for fd in diffs:
+                    mask |= select_file(fd)
+                    if mask == ALL:
+                        break
+                only_proven_py = all(
+                    (fd.old or "").startswith("sqlglot/") and fd.old == fd.new and fd.old.endswith(".py")
+                    and not fd.is_new and not fd.is_deleted and not fd.binary for fd in diffs)
+                if not VM["used"] or (mask == 0 and only_proven_py and not NEEDS_IMPORT_CHECK):
                     break
+                log("valuemap", patch.stem, "not applicable to the whole patch; recomputing without it")
             if mask != ALL and NEEDS_IMPORT_CHECK and not imports_ok(patch.stem, diffs):
                 mask = ALL
         except Exception as e:  # never crash: fall back to everything

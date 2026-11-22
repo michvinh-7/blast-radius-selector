@@ -64,6 +64,39 @@ Whenever a patch relies on that rule, or adds, removes or renames any name bound
 failures with the pinned list, which is computed at Docker build time. If any module imports differently,
 every test is selected.
 
+## 4. Value profile of comparisons (`valuemap.py`, `cmpmap.bin`)
+
+**Map built from the pinned commit.** The full test suite runs on the pinned commit with every
+single-operator comparison in `sqlglot/` instrumented. That includes import and collection time, pytest-xdist
+workers and spawned pool workers. It runs twice, under different hash seeds, and both runs pass all 1620 tests.
+
+For each comparison site, `cmpmap.bin` records what the comparison was evaluated on:
+
+* The distinct operand pairs, with their types, when both operands are plain values (None, bool, int, float,
+  str, or tuples of these).
+* The results under every comparison operator, for Enum operands whose comparison methods aren't defined in
+  sqlglot.
+* Whether two objects with default, identity-based equality were compared.
+* Whether anything unclassifiable was seen, or the value set overflowed. Either makes the site unusable.
+
+This is an execution profile of the pinned code, in the same category as line coverage. It doesn't say which
+tests any edit breaks.
+
+**Runtime.** The check only applies when every change in the patch lies inside comparison nodes of `sqlglot/`
+files, where a comparison's operator changed or one of its literal operands changed. For each changed site, the
+selector re-evaluates the patched comparison on every recorded input and checks that it returns exactly the
+same result as the original.
+
+If every site does, no test can behave differently, by induction:
+
+* Execution is identical up to the first evaluation of a changed site.
+* That evaluation sees operands the profile recorded.
+* So it returns the original result.
+* Execution stays identical from there to the next evaluation, and so on.
+
+The selector then selects nothing. If any site was never recorded, was unsafe, or differs on even one input,
+or the patch changes anything else, the normal selection applies.
+
 ## Validation (not shipped)
 
 The selector was checked against synthetic mutants of the pinned commit, with ground truth from running the
