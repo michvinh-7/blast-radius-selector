@@ -1000,6 +1000,7 @@ def main():
 
     out = []
     for cid, numbers, _ in rows:
+        numbers = [n for n in numbers if dur_ms[n] >= 1000]  # PROBE P11 (practice only, never final): keep only tests >= 1 s
         out.append(json.dumps({"commit": cid, "workers": assign(numbers)}))
         log(cid, len(numbers))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
