@@ -78,7 +78,12 @@ def _fp(v, st):
     if True:
         if isinstance(v, types.FunctionType):
             cells = tuple(fp(c.cell_contents, st) if _has(c) else ("EMPTY",) for c in (v.__closure__ or ()))
-            return ("F", v.__module__, v.__qualname__, code_fp(v.__code__, st), fp(v.__defaults__, st),
+            # The selector only uses these fingerprints for patches whose every changed line is inside a
+            # class-level table literal: the only functions such a patch can create or change are lambdas
+            # (a def cannot appear in an expression). Named functions keep identical code, so their code
+            # object is not fingerprinted (defaults and closure contents still are).
+            code = code_fp(v.__code__, st) if "<lambda>" in v.__qualname__ else ("named", v.__code__.co_name)
+            return ("F", v.__module__, v.__qualname__, code, fp(v.__defaults__, st),
                     fp(v.__kwdefaults__, st), cells)
         if isinstance(v, types.BuiltinFunctionType):
             return ("B", getattr(v, "__module__", None), v.__qualname__, fp(getattr(v, "__self__", None), st)

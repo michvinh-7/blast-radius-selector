@@ -1075,8 +1075,7 @@ def _tab_map():
         nums = [num_by_id.get(t) for t in ids]
         untracked = {nums[i] for i in d["untracked"]} | {n for n in nums if n is None}
         tracked = {n for n in nums if n is not None} - untracked
-        idx = {oa: {k: frozenset(nums[i] for i in v) for k, v in ks.items()} for oa, ks in d["idx"].items()}
-        _TAB["m"] = (tracked, idx)
+        _TAB["m"] = (tracked, d["idx"], nums)
     return _TAB["m"]
 
 
@@ -1218,14 +1217,13 @@ def tab_changes(cid, diffs):
 
 
 def tab_keep(numbers, changed):
-    tracked, idx = _tab_map()
+    tracked, idx, nums = _tab_map()
     hit = set()
     tables = {oa for oa, _ in changed}
     for oa, k in changed:
-        ks = idx.get(oa, {})
-        hit |= ks.get(k, frozenset())
+        hit.update(nums[i] for i in idx.get(oa, {}).get(k, ()))
     for oa in tables:
-        hit |= idx.get(oa, {}).get("*", frozenset())
+        hit.update(nums[i] for i in idx.get(oa, {}).get("*", ()))
     return [n for n in numbers if n not in tracked or n in hit]
 
 
@@ -1272,11 +1270,13 @@ def main():
 
     # table-entry narrowing (before Fix B / generator memory, which then see the narrowed selection)
     tchecks = []
-    if TAB_PATH.exists():
-        tracked, _ = _tab_map()
-        for i, (cid, numbers, diffs) in enumerate(rows):
-            if diffs is None or not numbers or len(numbers) >= len(dur_ms) - 10 or not tables_only(diffs):
-                continue
+    tcand = [i for i, (cid, numbers, diffs) in enumerate(rows)
+             if diffs is not None and numbers and len(numbers) < len(dur_ms) - 10 and cost_ms(numbers) > TAB_MIN_SAVING_MS
+             and tables_only(diffs)] if TAB_PATH.exists() else []
+    if tcand:
+        tracked = _tab_map()[0]  # loaded only when some commit is eligible
+        for i in tcand:
+            cid, numbers, diffs = rows[i]
             floor = cost_ms([n for n in numbers if n not in tracked])
             if cost_ms(numbers) - floor > TAB_MIN_SAVING_MS:
                 tchecks.append(i)
