@@ -1050,6 +1050,81 @@ def genmem_cold_ok(cid, diffs):
         shutil.rmtree(td, ignore_errors=True)
 
 
+def _p16_table_only(diffs):
+    """PROBE P16 (practice only, never final): every changed line lies inside a class-level
+    assignment whose value is a dict/set/list/tuple display or comprehension (TRANSFORMS, FUNCTIONS,
+    KEYWORDS, TYPE_MAPPING, ...), in non-test sqlglot code."""
+    import ast
+
+    if not diffs:
+        return False
+    for fd in diffs:
+        if fd.is_new or fd.is_deleted or fd.binary or fd.old != fd.new or not fd.old.startswith("sqlglot/") \
+                or not fd.old.endswith(".py") or not fd.hunks:
+            return False
+        old = read_old(fd.old)
+        if old is None:
+            return False
+        try:
+            tree = ast.parse("\n".join(old))
+            ast.parse(apply_blocks(old, fd.hunks))
+        except SyntaxError:
+            return False
+        TAB = (ast.Dict, ast.Set, ast.List, ast.Tuple, ast.DictComp, ast.SetComp, ast.ListComp)
+        ranges = []
+        for c in ast.walk(tree):
+            if isinstance(c, ast.ClassDef):
+                for st in c.body:
+                    if isinstance(st, (ast.Assign, ast.AnnAssign)) and isinstance(st.value, TAB):
+                        ranges.append((st.lineno, st.end_lineno))
+        for b in fd.hunks:
+            lines = [ln for ln, _ in b["rem"]] or [b["pos"] - 1, b["pos"]]
+            if not any(all(lo <= L <= hi for L in lines) for lo, hi in ranges):
+                return False
+    return True
+
+
+def _p18_flip_only(diffs):
+    """PROBE P18 (practice only, never final): every hunk replaces one line by one line differing in
+    exactly one token, and that token is a comparison/boolean operator, a constant or a literal."""
+    import io as _io
+    import tokenize as _tk
+
+    FLIP_OPS = {"==", "!=", "<", "<=", ">", ">=", "is", "in", "not", "and", "or", "True", "False", "None", "+", "-"}
+    if not diffs:
+        return False
+    for fd in diffs:
+        if fd.is_new or fd.is_deleted or fd.binary or fd.old != fd.new or not fd.old.startswith("sqlglot/") \
+                or not fd.old.endswith(".py") or not fd.hunks:
+            return False
+        for b in fd.hunks:
+            if len(b["rem"]) != 1 or len(b["add"]) != 1:
+                return False
+            try:
+                ta = [(t.type, t.string) for t in _tk.generate_tokens(_io.StringIO(b["rem"][0][1].strip() + "\n").readline)]
+                tb = [(t.type, t.string) for t in _tk.generate_tokens(_io.StringIO(b["add"][0].strip() + "\n").readline)]
+            except (_tk.TokenError, SyntaxError, IndentationError):
+                return False
+            if len(ta) != len(tb):
+                return False
+            d = [(x, y) for x, y in zip(ta, tb) if x != y]
+            if len(d) != 1:
+                return False
+            (xa, xs), (ya, ys) = d[0]
+            if not (xs in FLIP_OPS or ys in FLIP_OPS or xa in (_tk.NUMBER, _tk.STRING) or ya in (_tk.NUMBER, _tk.STRING)):
+                return False
+    return True
+
+
+_P6B = {num_by_id[i] for i in (
+    "tests/test_executor.py::TestExecutor::test_execute_tpch",
+    "tests/test_executor.py::TestExecutor::test_optimized_tpch",
+    "tests/test_executor.py::TestExecutor::test_agg_order",
+    "tests/test_generator.py::TestGenerator::test_generator_memory",
+    "tests/test_schema.py::TestSchema::test_cache_does_not_retain_queries",
+) if i in num_by_id}
+
+
 def main():
     global T0
     import time
@@ -1089,6 +1164,12 @@ def main():
         numbers = mask_to_numbers(mask)
         if mask == ALL:
             numbers = sorted(set(numbers) | set(EXTRA_NUMS))
+        # PROBE P19 (practice only, never final): stacked blind skips that scored 0 misses on the board
+        if diffs is not None and _p16_table_only(diffs):
+            numbers = []  # P16
+        elif diffs is not None and _p18_flip_only(diffs):
+            numbers = [n for n in numbers if dur_ms[n] < 1000]  # P18
+        numbers = [n for n in numbers if n not in _P6B]  # P6b
         rows.append((patch.stem, numbers, diffs))
 
     checks = []
