@@ -811,6 +811,9 @@ def main():
     checks = []
     if fixb_ready:
         for i, (cid, numbers, diffs) in enumerate(rows):
+            if diffs is not None and TPCDS_NUM in numbers and not fixb_eligible(diffs):
+                rows[i] = (rows[i][0], [n for n in numbers if n != TPCDS_NUM], diffs)  # PROBE P4b: drop when INELIGIBLE
+                continue
             if diffs is None or TPCDS_NUM not in numbers or not fixb_eligible(diffs):
                 continue
             without = [n for n in numbers if n != TPCDS_NUM]
