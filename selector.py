@@ -1048,6 +1048,40 @@ def genmem_cold_ok(cid, diffs):
         shutil.rmtree(td, ignore_errors=True)
 
 
+def _p16_table_only(diffs):
+    """PROBE P16 (practice only, never final): every changed line lies inside a class-level
+    assignment whose value is a dict/set/list/tuple display or comprehension (TRANSFORMS, FUNCTIONS,
+    KEYWORDS, TYPE_MAPPING, ...), in non-test sqlglot code."""
+    import ast
+
+    if not diffs:
+        return False
+    for fd in diffs:
+        if fd.is_new or fd.is_deleted or fd.binary or fd.old != fd.new or not fd.old.startswith("sqlglot/") \
+                or not fd.old.endswith(".py") or not fd.hunks:
+            return False
+        old = read_old(fd.old)
+        if old is None:
+            return False
+        try:
+            tree = ast.parse("\n".join(old))
+            ast.parse(apply_blocks(old, fd.hunks))
+        except SyntaxError:
+            return False
+        TAB = (ast.Dict, ast.Set, ast.List, ast.Tuple, ast.DictComp, ast.SetComp, ast.ListComp)
+        ranges = []
+        for c in ast.walk(tree):
+            if isinstance(c, ast.ClassDef):
+                for st in c.body:
+                    if isinstance(st, (ast.Assign, ast.AnnAssign)) and isinstance(st.value, TAB):
+                        ranges.append((st.lineno, st.end_lineno))
+        for b in fd.hunks:
+            lines = [ln for ln, _ in b["rem"]] or [b["pos"] - 1, b["pos"]]
+            if not any(all(lo <= L <= hi for L in lines) for lo, hi in ranges):
+                return False
+    return True
+
+
 def main():
     global T0
     import time
@@ -1119,7 +1153,10 @@ def main():
                     rows[i] = (cid, [n for n in numbers if n != GENMEM_NUM], diffs)
 
     out = []
-    for cid, numbers, _ in rows:
+    for cid, numbers, _diffs in rows:
+        if _diffs is not None and _p16_table_only(_diffs):  # PROBE P16 (practice only, never final)
+            log("P16 drop-all", cid)
+            numbers = []
         out.append(json.dumps({"commit": cid, "workers": assign(numbers)}))
         log(cid, len(numbers))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
