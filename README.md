@@ -44,7 +44,16 @@ When a patch touches only `sqlglot/` and not `sqlglot/executor/`, and dropping t
   `fixb_build.py` during the Docker build, with the same Python.
 
 If every fingerprint matches, the test receives identical input and runs on unchanged executor code, so its
-outcome can't change, and the selector drops it. Any difference, exception, timeout or exhausted time budget
+outcome can't change, and the selector drops it.
+
+A patch may also touch files outside `sqlglot/`, but only when none of them can reach the test:
+
+* **No Python files.** Every test module shares the pytest process, so a `.py` edit can't be ruled out.
+* **Not the test's own files:** its module, `tests/helpers.py`, the TPC-DS fixture data, or any configuration file.
+* **Not a file the test was recorded opening.**
+* **`tpc-ds.sql` edits** are re-parsed with an exact copy of the test's fixture parser. Every `(meta, sql)` input
+  must stay byte-identical, because the test parses all of them, not only the executed ones.
+* **`tpc-h.sql` edits** only have to parse. The test's class setup parses that file, but the test never reads it. Any difference, exception, timeout or exhausted time budget
 keeps the test. This is the "run sqlglot's code while you decide" option, and its CPU time is paid for.
 
 ## 3. Function signatures and import-time safety (`impcheck.py`)
