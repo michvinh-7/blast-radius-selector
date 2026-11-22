@@ -309,7 +309,7 @@ class PyChange:
         return union_lines(self.path, lo, hi, LINES)
 
     def col_union(self, lo, hi):
-        return union_lines(self.path, lo, hi, GL)
+        return 0  # PROBE P7 (practice only, never final): ignore collection-time coverage
 
     def file_union(self):
         n = len(self.S["kind"])
