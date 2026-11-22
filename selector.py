@@ -635,6 +635,19 @@ def _pinned_names():
     return _NAMES
 
 
+_PLAIN = None
+
+
+def _plain_classes():
+    global _PLAIN
+    if _PLAIN is None:
+        try:
+            _PLAIN = frozenset((APP / "pinned_classes.txt").read_text().split("\n"))
+        except OSError:
+            _PLAIN = frozenset()
+    return _PLAIN
+
+
 def _new_to_old(old_n, blocks):
     """new line number -> old line number (None for added lines), 1-based, index 0 unused."""
     m = [None]
@@ -809,6 +822,21 @@ def narrow_insertion(ch, path, old, new_text, blocks, b):
         return m
     if isinstance(scope, (ast.Module, ast.ClassDef)) and owner is scope and field == "body":
         # rule (2)
+        if isinstance(scope, ast.ClassDef):
+            # only plain classes (no Enum / dataclass / NamedTuple / TypedDict / Protocol / unknown
+            # metaclass: there a new attribute is a new member or field), and no class decorators
+            q, n = [], scope
+            while n is not None and not isinstance(n, ast.Module):
+                if isinstance(n, ast.ClassDef):
+                    if n.decorator_list:
+                        return None
+                    q.append(n.name)
+                elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    return None  # class created inside a function: not in the build-time list
+                n = parents.get(id(n))
+            modname = path[:-3].replace("/", ".").removesuffix(".__init__")
+            if f"{modname}:{'.'.join(reversed(q))}" not in _plain_classes():
+                return None
         future = any(isinstance(st, ast.ImportFrom) and st.module == "__future__" and any(a.name == "annotations" for a in st.names)
                      for st in tree.body)
         names = set()
