@@ -140,3 +140,13 @@ See `tools/`:
 * `iso_plugin.py` runs each test in a forked child with coverage.
 * `classhook.py` records instantiated classes.
 * `build_map.py` assembles `map.bin` and `src.bin`.
+
+## 6. Pure insertions (`narrow_insertion`, `pinned_names.txt`)
+- Inside a function: inserted complete statements run only when execution reaches the insertion
+  point, so only the tests that ran the previous or next sibling statement are selected - if the
+  insertion binds no name the rest of the function mentions (unless already local), has no
+  yield/await/global/nonlocal, and is not at the start of the function body.
+- At module/class level: new undecorated functions with constant defaults and constant assignments
+  whose names appear nowhere in the pinned sources (`names_build.py` indexes every word of every
+  pinned file) select nothing; *_sql/_parse* names (looked up by name) and classes are excluded,
+  and the import check runs.

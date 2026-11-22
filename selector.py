@@ -5,6 +5,7 @@ Reads /data/tests.json and /data/commits/*.patch, answers from a precomputed map
 pinned sqlglot commit, and prints one JSON line per commit.
 """
 
+import gc; gc.set_threshold(100000, 50, 100)  # short-lived process: collect cyclic garbage rarely (CPU is scored)
 import io
 import json
 import os
@@ -32,6 +33,7 @@ num_by_id = {t["id"]: t["number"] for t in tests}
 dur_ms = {t["number"]: int(round(t["seconds"] * 1000)) for t in tests}
 
 M = pickle.loads(zlib.decompress((APP / "map.bin").read_bytes()))
+gc.freeze()  # long-lived map: keep it out of every later collection
 IDS = M["ids"]
 SETS = M["sets"]
 LINES = M["lines"]
@@ -540,6 +542,7 @@ def select_py(fd, path, blocks):
     ch = PyChange(path, old)
     # whole-file semantic equivalence
     new_text = apply_blocks(old, blocks)
+    all_blocks = blocks  # (comment-only blocks are filtered below; offsets need them all)
     try:
         import ast
 
@@ -592,6 +595,10 @@ def select_py(fd, path, blocks):
         for (ln, _) in rem:
             m |= ch.line_mask(ln)
         if not rem:
+            nm = narrow_insertion(ch, path, old, new_text, all_blocks, b)
+            if nm is not None:
+                m |= nm
+                continue
             a = b["pos"] - 1
             m |= ch.insertion_mask(a, a + 1, add)
         elif len(add) > len(rem):
@@ -600,6 +607,320 @@ def select_py(fd, path, blocks):
         if m == ALL:
             return ALL
     return m
+
+
+# ------------------------------------------------------------------ pure insertions
+# A pure insertion (added lines, nothing removed) used to select every test that ran the enclosing
+# function, or for a new definition every user of its neighbours / file. Two sharper, sound cases:
+# (1) INSIDE A FUNCTION: inserted complete statements can only run when execution reaches the
+#     insertion point, i.e. after the previous sibling statement or before the next one ran. So
+#     select the tests that ran either sibling - provided the insertion cannot change the function
+#     elsewhere: it binds no name that was not already local (a new local name would make earlier
+#     reads of that name local -> UnboundLocalError), has no yield/await/global/nonlocal, and is not
+#     at the start of the function body (docstring).
+# (2) AT MODULE OR CLASS LEVEL: new plain functions (no decorators, constant defaults) and constant
+#     assignments whose names are mentioned NOWHERE in the pinned sources (no code, string or test
+#     mentions them; sqlglot's only name-built lookups are *_sql / _parse* and classes, which are
+#     excluded) cannot be reached by any pinned code: they select nothing. The import check still
+#     runs (bound names changed).
+_NAMES = None
+_NEWAST = {}
+
+
+def _pinned_names():
+    global _NAMES
+    if _NAMES is None:
+        try:
+            _NAMES = frozenset((APP / "pinned_names.txt").read_text().split("\n"))
+        except OSError:
+            _NAMES = frozenset()
+    return _NAMES
+
+
+_PLAIN = None
+
+
+def _plain_classes():
+    global _PLAIN
+    if _PLAIN is None:
+        try:
+            _PLAIN = frozenset((APP / "pinned_classes.txt").read_text().split("\n"))
+        except OSError:
+            _PLAIN = frozenset()
+    return _PLAIN
+
+
+def _source_readers(path):
+    """Tests that read this file's source text (e.g. test_typing parses sqlglot/typing/*.py and
+    compares code objects): an insertion changes what they read, whatever runs."""
+    m = OPENS.get(path, 0)
+    if path.startswith("sqlglot/typing/"):
+        m |= tests_of_file("tests/test_typing.py")
+    return m
+
+
+def _new_to_old(old_n, blocks):
+    """new line number -> old line number (None for added lines), 1-based, index 0 unused."""
+    m = [None]
+    cur = 1
+    for b in sorted(blocks, key=lambda b: b["pos"]):
+        lo = b["pos"]
+        for L in range(cur, lo):
+            m.append(L)
+        m.extend([None] * len(b["add"]))
+        cur = lo + len(b["rem"])
+    for L in range(cur, old_n + 1):
+        m.append(L)
+    return m
+
+
+def _stmt_lists(tree):
+    import ast
+
+    for node in ast.walk(tree):
+        for field in ("body", "orelse", "finalbody"):
+            lst = getattr(node, field, None)
+            if isinstance(lst, list) and lst and isinstance(lst[0], ast.stmt):
+                yield node, field, lst
+        for h in getattr(node, "handlers", None) or []:
+            yield h, "body", h.body
+        for c in getattr(node, "cases", None) or []:
+            yield c, "body", c.body
+
+
+def _overlap_walk(tree, n0, n1):
+    """ast.walk order (breadth-first), restricted to nodes whose line span (decorators included)
+    overlaps [n0, n1] or that carry no line info, plus a parent map for every enqueued node. A
+    statement list outside the region cannot contain statements inside [n0, n1], so the lists this
+    yields are exactly those of the full walk that can matter, in the same relative order."""
+    from collections import deque
+
+    def overlaps(n):
+        lo = getattr(n, "lineno", None)
+        hi = getattr(n, "end_lineno", None)
+        if lo is None or hi is None:
+            return True
+        for d in getattr(n, "decorator_list", None) or []:
+            lo = min(lo, d.lineno)
+        return not (hi < n0 or lo > n1)
+
+    import ast
+
+    order, parents = [], {}
+    todo = deque([tree])
+    while todo:
+        n = todo.popleft()
+        order.append(n)
+        for c in ast.iter_child_nodes(n):
+            if overlaps(c):
+                parents[id(c)] = n
+                todo.append(c)
+    return order, parents
+
+
+def _lists_of(nodes):
+    import ast
+
+    for node in nodes:
+        for field in ("body", "orelse", "finalbody"):
+            lst = getattr(node, field, None)
+            if isinstance(lst, list) and lst and isinstance(lst[0], ast.stmt):
+                yield node, field, lst
+        for h in getattr(node, "handlers", None) or []:
+            yield h, "body", h.body
+        for c in getattr(node, "cases", None) or []:
+            yield c, "body", c.body
+
+
+def _start(st):
+    return min([st.lineno] + [d.lineno for d in getattr(st, "decorator_list", [])])
+
+
+def _bound_names(nodes):
+    """Names bound in the scope these statements belong to (nested def/class/lambda bodies excluded,
+    their own names included; walrus inside comprehensions binds in the enclosing scope)."""
+    import ast
+
+    out = set()
+
+    def rec(n, top):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(n.name)
+            for d in n.decorator_list:
+                rec(d, False)
+            if not isinstance(n, ast.ClassDef):
+                for d in n.args.defaults + [x for x in n.args.kw_defaults if x is not None]:
+                    rec(d, False)
+            return
+        if isinstance(n, ast.Lambda):
+            return
+        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            out.add(n.id)
+        elif isinstance(n, ast.NamedExpr):
+            out.add(n.target.id)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            for a in n.names:
+                out.add((a.asname or a.name).split(".")[0])
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            out.add(n.name)
+        elif type(n).__name__ in ("MatchAs", "MatchStar") and getattr(n, "name", None):
+            out.add(n.name)
+        elif type(n).__name__ == "MatchMapping" and getattr(n, "rest", None):
+            out.add(n.rest)
+        if isinstance(n, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            # comprehension targets are local to the comprehension; only walrus escapes
+            for x in ast.walk(n):
+                if isinstance(x, ast.NamedExpr):
+                    out.add(x.target.id)
+            return
+        for c in ast.iter_child_nodes(n):
+            rec(c, False)
+
+    for n in nodes:
+        rec(n, True)
+    return out
+
+
+def narrow_insertion(ch, path, old, new_text, blocks, b):
+    """Mask for a pure-insertion block under rules (1)/(2) above, or None for the general rule."""
+    import ast
+    import builtins
+
+    if ch.is_test or not path.startswith("sqlglot/") or b["rem"] or not b["add"]:
+        return None
+    key = (path, new_text)
+    if key not in _NEWAST:
+        _NEWAST.clear()
+        try:
+            _NEWAST[key] = ast.parse(new_text)
+        except SyntaxError:
+            _NEWAST[key] = None
+    tree = _NEWAST[key]
+    if tree is None:
+        return None
+    off = sum(len(x["add"]) - len(x["rem"]) for x in blocks if x["pos"] < b["pos"])
+    n0 = b["pos"] + off
+    n1 = n0 + len(b["add"]) - 1
+    code = [n0 + i for i, t in enumerate(b["add"]) if not COMMENTISH.match(t)]
+    if not code:
+        return None
+    # the inserted code lines must be exactly a run of whole statements of one statement list
+    found = None
+    order, parents = _overlap_walk(tree, n0, n1)
+    for owner, field, lst in _lists_of(order):
+        idx = [i for i, st in enumerate(lst) if n0 <= _start(st) and st.end_lineno <= n1]
+        if not idx:
+            continue
+        if idx != list(range(idx[0], idx[-1] + 1)):
+            return None
+        covered = {L for i in idx for L in range(_start(lst[i]), lst[i].end_lineno + 1)}
+        if not all(L in covered for L in code):
+            continue
+        if any(i not in idx and not (lst[i].end_lineno < n0 or _start(lst[i]) > n1) for i in range(len(lst))):
+            return None
+        found = (owner, field, lst, idx[0], idx[-1])
+        break
+    if found is None:
+        return None
+    owner, field, lst, i, j = found
+    ins = lst[i:j + 1]
+    # nearest enclosing scope of the statement list (its ancestors all overlap the insertion)
+    scope = owner
+    while not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module, ast.Lambda)):
+        scope = parents.get(id(scope))
+        if scope is None:
+            return None
+    if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        # rule (1)
+        for st in ins:
+            for x in ast.walk(st):
+                if isinstance(x, (ast.Yield, ast.YieldFrom, ast.Await, ast.Global, ast.Nonlocal)):
+                    return None
+        if owner is scope and field == "body" and i == 0:
+            return None  # function docstring position
+        args = scope.args
+        local = {x.arg for x in args.posonlyargs + args.args + args.kwonlyargs}
+        local |= {x.arg for x in (args.vararg, args.kwarg) if x is not None}
+        saved = lst[i:j + 1]
+        del lst[i:j + 1]
+        try:
+            local |= _bound_names(scope.body)  # names local to the function without the insertion
+            # every identifier the rest of the function mentions (nested scopes included)
+            mentioned = {x.id for x in ast.walk(scope) if isinstance(x, ast.Name)} | \
+                {nm for x in ast.walk(scope) if isinstance(x, (ast.Global, ast.Nonlocal)) for nm in x.names} | \
+                {x.arg for x in ast.walk(scope) if isinstance(x, ast.arg)}
+        finally:
+            lst[i:i] = saved
+        # a name the insertion binds must already be local, or appear nowhere else in the function
+        # (otherwise making it local could change an earlier read or a closure's read of it)
+        for nm in _bound_names(ins) - local:
+            if nm in mentioned:
+                return None
+        n2o = _new_to_old(len(old), blocks)
+        m = 0
+        sib = []
+        if i > 0:
+            sib.append(lst[i - 1])
+        if j + 1 < len(lst):
+            sib.append(lst[j + 1])
+        if not sib:
+            return None
+        for st in sib:
+            lo, hi = _start(st), st.end_lineno
+            if hi >= len(n2o) or any(n2o[L] is None for L in range(lo, hi + 1)):
+                return None  # the sibling was edited too: use the general rule
+            m |= ch.run_union(n2o[lo], n2o[hi]) | ch.col_union(n2o[lo], n2o[hi])
+        log("insertion", path, f"inside a function: tests that reach new lines {n0}-{n1}")
+        return m | _source_readers(path)
+    if isinstance(scope, (ast.Module, ast.ClassDef)) and owner is scope and field == "body":
+        # rule (2)
+        if isinstance(scope, ast.ClassDef):
+            # only plain classes (no Enum / dataclass / NamedTuple / TypedDict / Protocol / unknown
+            # metaclass: there a new attribute is a new member or field), and no class decorators
+            q, n = [], scope
+            while n is not None and not isinstance(n, ast.Module):
+                if isinstance(n, ast.ClassDef):
+                    if n.decorator_list:
+                        return None
+                    q.append(n.name)
+                elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    return None  # class created inside a function: not in the build-time list
+                n = parents.get(id(n))
+            modname = path[:-3].replace("/", ".").removesuffix(".__init__")
+            if f"{modname}:{'.'.join(reversed(q))}" not in _plain_classes():
+                return None
+        future = any(isinstance(st, ast.ImportFrom) and st.module == "__future__" and any(a.name == "annotations" for a in st.names)
+                     for st in tree.body)
+        names = set()
+        for st in ins:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if st.decorator_list:
+                    return None
+                a = st.args
+                if not all(isinstance(d, ast.Constant) for d in a.defaults + [x for x in a.kw_defaults if x is not None]):
+                    return None
+                if not future and (st.returns is not None or any(x.annotation is not None for x in
+                                   a.posonlyargs + a.args + a.kwonlyargs + [y for y in (a.vararg, a.kwarg) if y])):
+                    return None
+                names.add(st.name)
+            elif isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name) \
+                    and isinstance(st.value, ast.Constant):
+                names.add(st.targets[0].id)
+            elif isinstance(st, ast.AnnAssign) and future and isinstance(st.target, ast.Name) and st.simple \
+                    and (st.value is None or isinstance(st.value, ast.Constant)):
+                names.add(st.target.id)
+            else:
+                return None
+        pinned = _pinned_names()
+        if not pinned:
+            return None
+        for nm in names:
+            if nm in pinned or hasattr(builtins, nm) or nm.startswith("__") or nm.endswith("_sql") or nm.startswith("_parse"):
+                return None
+        NEEDS_IMPORT_CHECK.add(path)
+        log("insertion", path, "new definitions no pinned code or test mentions:", sorted(names))
+        return _source_readers(path)
+    return None
 
 
 def dirname(p):
@@ -1127,3 +1448,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)  # skip interpreter teardown (CPU is scored)

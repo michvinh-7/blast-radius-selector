@@ -16,8 +16,10 @@ sqlglot/executor/.
 Any other exit (exception, crash, timeout) means "cannot vouch": the caller keeps the test.
 """
 
+import gc; gc.set_threshold(100000, 50, 100)  # short-lived process: collect cyclic garbage rarely (CPU is scored)
 import hashlib
 import json
+import os
 import pickle
 import re
 import sys
@@ -30,6 +32,16 @@ from sqlglot import exp, parse_one, transpile  # noqa: E402
 from sqlglot.executor.python import Python  # noqa: E402
 from sqlglot.optimizer import optimize  # noqa: E402
 from sqlglot.planner import Plan  # noqa: E402
+
+
+def _fastexit(code):
+    # skip interpreter teardown (a full GC + finalizers): CPU is scored
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
+
+
+
 
 data = json.load(open(data_path))
 SCHEMA = data["schema"]
@@ -66,8 +78,10 @@ for i, sql in enumerate(data["queries"]):
     h.update(transpile(sql, write="duckdb")[0].encode())
     res.append(h.hexdigest())
     if pinned is not None and res[-1] != pinned[i]:
-        sys.exit(3)
+        _fastexit(3)
 
 if pinned is not None:
-    sys.exit(0 if res == pinned else 3)
-json.dump(res, open(out, "w"))
+    _fastexit(0 if res == pinned else 3)
+with open(out, "w") as _f:
+    json.dump(res, _f)
+_fastexit(0)
