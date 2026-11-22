@@ -1048,6 +1048,19 @@ def genmem_cold_ok(cid, diffs):
         shutil.rmtree(td, ignore_errors=True)
 
 
+def _p17_additions_only(diffs):
+    """PROBE P17 (practice only, never final): every hunk only adds lines, in non-test sqlglot .py files."""
+    if not diffs:
+        return False
+    for fd in diffs:
+        if fd.is_new or fd.is_deleted or fd.binary or fd.old != fd.new or not fd.old.startswith("sqlglot/") \
+                or not fd.old.endswith(".py") or not fd.hunks:
+            return False
+        if any(b["rem"] for b in fd.hunks):
+            return False
+    return True
+
+
 def main():
     global T0
     import time
@@ -1119,7 +1132,10 @@ def main():
                     rows[i] = (cid, [n for n in numbers if n != GENMEM_NUM], diffs)
 
     out = []
-    for cid, numbers, _ in rows:
+    for cid, numbers, _diffs in rows:
+        if _diffs is not None and _p17_additions_only(_diffs):  # PROBE P17 (practice only, never final)
+            log("P17 drop-all", cid)
+            numbers = []
         out.append(json.dumps({"commit": cid, "workers": assign(numbers)}))
         log(cid, len(numbers))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
