@@ -762,7 +762,33 @@ def tpcds_independent(fd, path):
     return path.startswith(("tests/", "docs/")) or path.endswith((".md", ".rst", ".txt"))
 
 
+# sqlglot lines outside sqlglot/executor/ that run while the TPC-DS queries EXECUTE but never in the
+# fingerprinted pipeline (traced on the pinned commit): an edit there is invisible to the fingerprint.
+_EXEC_ONLY = None
+
+
+def touches_exec_only(diffs):
+    global _EXEC_ONLY
+    if _EXEC_ONLY is None:
+        try:
+            _EXEC_ONLY = {k: set(v) for k, v in json.loads((APP / "fixb_exec_only.json").read_text()).items()}
+        except OSError:
+            _EXEC_ONLY = None
+            return True  # cannot tell: be conservative
+    for fd in diffs:
+        lines = _EXEC_ONLY.get(fd.old or "")
+        if not lines:
+            continue
+        for b in fd.hunks:
+            touched = [ln for ln, _ in b["rem"]] or [b["pos"] - 1, b["pos"]]
+            if any(L in lines or L - 1 in lines or L + 1 in lines for L in touched):
+                return True
+    return False
+
+
 def fixb_eligible(diffs):
+    if touches_exec_only(diffs):
+        return False
     paths = set()
     for fd in diffs:
         if fd.binary:
