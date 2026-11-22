@@ -5,6 +5,7 @@ Reads /data/tests.json and /data/commits/*.patch, answers from a precomputed map
 pinned sqlglot commit, and prints one JSON line per commit.
 """
 
+import gc; gc.set_threshold(100000, 50, 100)  # short-lived process: collect cyclic garbage rarely (CPU is scored)
 import io
 import json
 import os
@@ -32,6 +33,7 @@ num_by_id = {t["id"]: t["number"] for t in tests}
 dur_ms = {t["number"]: int(round(t["seconds"] * 1000)) for t in tests}
 
 M = pickle.loads(zlib.decompress((APP / "map.bin").read_bytes()))
+gc.freeze()  # long-lived map: keep it out of every later collection
 IDS = M["ids"]
 SETS = M["sets"]
 LINES = M["lines"]
@@ -1405,3 +1407,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)  # skip interpreter teardown (CPU is scored)
