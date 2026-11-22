@@ -525,6 +525,14 @@ def header_block_mask(ch, path, old_text, new_text, block):
     return ch.run_union(h[2], h[3]) | ch.col_union(h[2], h[3])
 
 
+_CMP_TOKEN = re.compile(r"==|!=|<=|>=|<|>|\bis\b|\bin\b")
+
+
+def _may_touch_comparison(blocks):
+    """Cheap pre-filter for valuemap: a comparison-only change must touch a line with a comparison."""
+    return any(_CMP_TOKEN.search(t) for b in blocks for t in [x for _, x in b["rem"]] + b["add"])
+
+
 def select_py(fd, path, blocks):
     old = read_old(path)
     if old is None:
@@ -545,7 +553,7 @@ def select_py(fd, path, blocks):
     old_tokens = sem_tokens("\n".join(old))
     if old_tokens is not None and new_tokens is not None and old_tokens == new_tokens:
         return 0
-    if VM["enabled"] and not ch.is_test and path.startswith("sqlglot/"):
+    if VM["enabled"] and not ch.is_test and path.startswith("sqlglot/") and _may_touch_comparison(blocks):
         import valuemap
 
         if valuemap.file_equivalent(VALUEMAP_PATH, path, "\n".join(old), new_text):
@@ -606,7 +614,10 @@ def select_other(fd, path):
     if path.startswith("sqlglotc/"):
         m |= tests_of_file("tests/test_sqlglotc.py")
     if base in ("pyproject.toml", "setup.py", "setup.cfg", "tox.ini", "pytest.ini", "conftest.py", "requirements.lock"):
-        m |= ALL if base in ("pytest.ini", "conftest.py", "tox.ini") else tests_of_file("tests/test_sqlglotc.py")
+        # pytest reads setup.cfg / pyproject.toml / tox.ini / pytest.ini / conftest.py at startup: an edit
+        # can make the whole run error (e.g. a duplicate key in setup.cfg fails every test)
+        startup = ("pytest.ini", "conftest.py", "tox.ini", "setup.cfg", "pyproject.toml")
+        m |= ALL if base in startup else tests_of_file("tests/test_sqlglotc.py")
     return m
 
 
@@ -627,6 +638,12 @@ def select_file(fd):
             return ALL if not path.startswith("tests/") else tests_of_file(path)
         return select_py(fd, path, fd.hunks)
     if path.endswith(".py") and (fd.is_new or path not in STRUCT):
+        # files Python or pytest pick up implicitly: conftest plugins, site customization, package
+        # markers in the test tree, and repo-root modules (the root is on sys.path and can shadow imports)
+        base = os.path.basename(path)
+        if (base in ("conftest.py", "sitecustomize.py", "usercustomize.py")
+                or (base == "__init__.py" and path.startswith("tests/")) or "/" not in path):
+            return ALL
         if path.startswith("tests/"):
             return 0
         return 0
@@ -762,7 +779,33 @@ def tpcds_independent(fd, path):
     return path.startswith(("tests/", "docs/")) or path.endswith((".md", ".rst", ".txt"))
 
 
+# sqlglot lines outside sqlglot/executor/ that run while the TPC-DS queries EXECUTE but never in the
+# fingerprinted pipeline (traced on the pinned commit): an edit there is invisible to the fingerprint.
+_EXEC_ONLY = None
+
+
+def touches_exec_only(diffs):
+    global _EXEC_ONLY
+    if _EXEC_ONLY is None:
+        try:
+            _EXEC_ONLY = {k: set(v) for k, v in json.loads((APP / "fixb_exec_only.json").read_text()).items()}
+        except OSError:
+            _EXEC_ONLY = None
+            return True  # cannot tell: be conservative
+    for fd in diffs:
+        lines = _EXEC_ONLY.get(fd.old or "")
+        if not lines:
+            continue
+        for b in fd.hunks:
+            touched = [ln for ln, _ in b["rem"]] or [b["pos"] - 1, b["pos"]]
+            if any(L in lines or L - 1 in lines or L + 1 in lines for L in touched):
+                return True
+    return False
+
+
 def fixb_eligible(diffs):
+    if touches_exec_only(diffs):
+        return False
     paths = set()
     for fd in diffs:
         if fd.binary:
@@ -796,6 +839,44 @@ def fixb_apply(root, diffs):
             old_p.unlink()
 
 
+_FIXB_LINES = None
+
+
+def _unreached_by_tpcds(diffs):
+    """True only if every changed sqlglot line sits inside a function body (not import-time code) and
+    is never executed by the test's pipeline or query execution on the pinned commit (traced under the
+    scorer's Python). Then the patched code paths it runs are the pinned ones: identical fingerprint."""
+    global _FIXB_LINES
+    if _FIXB_LINES is None:
+        try:
+            d = json.loads((APP / "fixb_lines.json").read_text())
+            _FIXB_LINES = {f: set(d["pipe"].get(f, [])) | set(d["exec"].get(f, [])) for f in set(d["pipe"]) | set(d["exec"])}
+        except (OSError, ValueError, KeyError):
+            _FIXB_LINES = {}
+            return False
+    if not _FIXB_LINES:
+        return False
+    for fd in diffs:
+        p = fd.old or fd.new
+        if not p or not p.startswith("sqlglot/"):
+            continue
+        if fd.is_new or fd.is_deleted or fd.binary or fd.old != fd.new:
+            return False
+        old = read_old(p)
+        if old is None:
+            return False
+        bodies = [(h[2], h[3]) for h in def_headers(p, "\n".join(old))]
+        run = _FIXB_LINES.get(p, set())
+        for b in fd.hunks:
+            touched = [ln for ln, _ in b["rem"]] or [b["pos"] - 1, b["pos"]]
+            for L in touched:
+                if not any(lo <= L <= hi for lo, hi in bodies):
+                    return False  # import-time / class-level code
+                if L in run or L - 1 in run or L + 1 in run:
+                    return False
+    return True
+
+
 def fixb_same(cid, diffs):
     """True only if fixb.py proves the TPC-DS pipeline output is unchanged."""
     import shutil
@@ -805,6 +886,9 @@ def fixb_same(cid, diffs):
 
     if not any(p.startswith("sqlglot/") for fd in diffs for p in (fd.old, fd.new) if p):
         log("fixb", cid, "SAME (no sqlglot code changed; other files vetted)")
+        return True
+    if _unreached_by_tpcds(diffs):
+        log("fixb", cid, "SAME (changed lines never run by the TPC-DS pipeline or execution)")
         return True
     if time.time() - T0 > FIXB_BUDGET_S:
         log("fixb", cid, "skipped: time budget")
