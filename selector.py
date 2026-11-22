@@ -630,6 +630,12 @@ def select_file(fd):
             return ALL if not path.startswith("tests/") else tests_of_file(path)
         return select_py(fd, path, fd.hunks)
     if path.endswith(".py") and (fd.is_new or path not in STRUCT):
+        # files Python or pytest pick up implicitly: conftest plugins, site customization, package
+        # markers in the test tree, and repo-root modules (the root is on sys.path and can shadow imports)
+        base = os.path.basename(path)
+        if (base in ("conftest.py", "sitecustomize.py", "usercustomize.py")
+                or (base == "__init__.py" and path.startswith("tests/")) or "/" not in path):
+            return ALL
         if path.startswith("tests/"):
             return 0
         return 0
