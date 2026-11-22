@@ -525,6 +525,14 @@ def header_block_mask(ch, path, old_text, new_text, block):
     return ch.run_union(h[2], h[3]) | ch.col_union(h[2], h[3])
 
 
+_CMP_TOKEN = re.compile(r"==|!=|<=|>=|<|>|\bis\b|\bin\b")
+
+
+def _may_touch_comparison(blocks):
+    """Cheap pre-filter for valuemap: a comparison-only change must touch a line with a comparison."""
+    return any(_CMP_TOKEN.search(t) for b in blocks for t in [x for _, x in b["rem"]] + b["add"])
+
+
 def select_py(fd, path, blocks):
     old = read_old(path)
     if old is None:
@@ -545,7 +553,7 @@ def select_py(fd, path, blocks):
     old_tokens = sem_tokens("\n".join(old))
     if old_tokens is not None and new_tokens is not None and old_tokens == new_tokens:
         return 0
-    if VM["enabled"] and not ch.is_test and path.startswith("sqlglot/"):
+    if VM["enabled"] and not ch.is_test and path.startswith("sqlglot/") and _may_touch_comparison(blocks):
         import valuemap
 
         if valuemap.file_equivalent(VALUEMAP_PATH, path, "\n".join(old), new_text):
@@ -831,6 +839,44 @@ def fixb_apply(root, diffs):
             old_p.unlink()
 
 
+_FIXB_LINES = None
+
+
+def _unreached_by_tpcds(diffs):
+    """True only if every changed sqlglot line sits inside a function body (not import-time code) and
+    is never executed by the test's pipeline or query execution on the pinned commit (traced under the
+    scorer's Python). Then the patched code paths it runs are the pinned ones: identical fingerprint."""
+    global _FIXB_LINES
+    if _FIXB_LINES is None:
+        try:
+            d = json.loads((APP / "fixb_lines.json").read_text())
+            _FIXB_LINES = {f: set(d["pipe"].get(f, [])) | set(d["exec"].get(f, [])) for f in set(d["pipe"]) | set(d["exec"])}
+        except (OSError, ValueError, KeyError):
+            _FIXB_LINES = {}
+            return False
+    if not _FIXB_LINES:
+        return False
+    for fd in diffs:
+        p = fd.old or fd.new
+        if not p or not p.startswith("sqlglot/"):
+            continue
+        if fd.is_new or fd.is_deleted or fd.binary or fd.old != fd.new:
+            return False
+        old = read_old(p)
+        if old is None:
+            return False
+        bodies = [(h[2], h[3]) for h in def_headers(p, "\n".join(old))]
+        run = _FIXB_LINES.get(p, set())
+        for b in fd.hunks:
+            touched = [ln for ln, _ in b["rem"]] or [b["pos"] - 1, b["pos"]]
+            for L in touched:
+                if not any(lo <= L <= hi for lo, hi in bodies):
+                    return False  # import-time / class-level code
+                if L in run or L - 1 in run or L + 1 in run:
+                    return False
+    return True
+
+
 def fixb_same(cid, diffs):
     """True only if fixb.py proves the TPC-DS pipeline output is unchanged."""
     import shutil
@@ -840,6 +886,9 @@ def fixb_same(cid, diffs):
 
     if not any(p.startswith("sqlglot/") for fd in diffs for p in (fd.old, fd.new) if p):
         log("fixb", cid, "SAME (no sqlglot code changed; other files vetted)")
+        return True
+    if _unreached_by_tpcds(diffs):
+        log("fixb", cid, "SAME (changed lines never run by the TPC-DS pipeline or execution)")
         return True
     if time.time() - T0 > FIXB_BUDGET_S:
         log("fixb", cid, "skipped: time budget")
