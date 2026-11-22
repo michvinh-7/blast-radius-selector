@@ -545,6 +545,13 @@ def select_py(fd, path, blocks):
     old_tokens = sem_tokens("\n".join(old))
     if old_tokens is not None and new_tokens is not None and old_tokens == new_tokens:
         return 0
+    if VM["enabled"] and not ch.is_test and path.startswith("sqlglot/"):
+        import valuemap
+
+        if valuemap.file_equivalent(VALUEMAP_PATH, path, "\n".join(old), new_text):
+            VM["used"] = True
+            log("valuemap", path, "comparison change proven result-preserving on all recorded inputs")
+            return 0
     # comment-only blocks
     cblocks = [
         b
@@ -660,6 +667,12 @@ def cost_ms(numbers):
 # code (sqlglot/executor/) and nothing outside sqlglot/, the test sees identical input on identical
 # executor code, so it cannot change outcome. fixb.py checks this on a /tmp copy of the patched
 # sources; any error, difference or timeout keeps the test.
+# Value-profile check (valuemap.py): a patch whose only changes are comparisons that return the same
+# result on every input the pinned suite fed them cannot change any test. Valid only if EVERY changed
+# file is proven this way (otherwise other changes could feed the comparisons new values).
+VALUEMAP_PATH = APP / "cmpmap.bin"
+VM = {"enabled": True, "used": False}
+
 TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 TPCDS_NUM = num_by_id.get(TPCDS_ID)
 FIXB_PINNED_SRC = Path(os.environ.get("FIXB_PINNED_SRC", APP / "pinned"))  # pristine sqlglot/ tree
@@ -671,13 +684,99 @@ FIXB_BUDGET_S = 100  # stop starting new checks this far into the run (limit: 18
 T0 = None
 
 
+# Files test_execute_tpcds can depend on outside sqlglot/: its own module, the helpers it imports, its
+# fixtures, and anything that configures pytest or the package. Any other non-sqlglot file is safe to
+# ignore for this test if the coverage map shows the test never opened it.
+TPCDS_DEPS = ("tests/test_executor.py", "tests/helpers.py", "tests/__init__.py")
+TPCDS_DIRS = ("tests/fixtures/optimizer/tpc-ds/",)
+CONFIG_NAMES = ("conftest.py", "pyproject.toml", "setup.py", "setup.cfg", "pytest.ini", "tox.ini", "requirements.lock")
+_TPCDS_BIT = None
+
+
+# The two fixture files TestExecutor.setUpClass parses. test_execute_tpcds parses every TPC-DS
+# (meta, sql) input and executes the flagged ones; TPC-H only has to parse. Parser replicated from
+# tests/helpers.py at eb11aec.
+TPCDS_SQL, TPCH_SQL = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql", "tests/fixtures/optimizer/tpc-h/tpc-h.sql"
+_FIXTEXT = None
+
+
+def _helpers_pairs(text):
+    """tests/helpers.py load_sql_fixture_pairs at eb11aec, on a string."""
+    statements = "\n".join([line for line in text.splitlines() if line and not line.startswith("--")]).split(";")
+    out = []
+    for i in range(0, len(statements), 2):
+        if i + 1 < len(statements):
+            sql = statements[i].strip()
+            meta, lines, j = {}, sql.split("\n"), 0
+            while lines[j].startswith("#"):
+                key, val = lines[j].split(":", maxsplit=1)
+                meta[key.lstrip("#").strip()] = val.strip()
+                j += 1
+            out.append((meta, "\n".join(lines[j:]), statements[i + 1].strip()))
+    return out
+
+
+def fixture_inputs_unchanged(fd):
+    """True if editing this setUpClass fixture leaves test_execute_tpcds's inputs byte-identical."""
+    global _FIXTEXT
+    if fd.is_new or fd.is_deleted or fd.binary or fd.old != fd.new or fd.old not in (TPCDS_SQL, TPCH_SQL):
+        return False
+    if _FIXTEXT is None:
+        import gzip
+
+        _FIXTEXT = json.loads(gzip.decompress((APP / "fixb_fixtures.json.gz").read_bytes()))
+    old = _FIXTEXT[fd.old[len("tests/fixtures/optimizer/"):]]
+    new = apply_blocks(old.split("\n"), fd.hunks)
+    try:
+        old_pairs, new_pairs = _helpers_pairs(old), _helpers_pairs(new)
+    except Exception:  # setUpClass would raise: the test errors
+        return False
+    if fd.old == TPCH_SQL:
+        return True  # parses fine; test_execute_tpcds never reads its content
+    # test_execute_tpcds parses EVERY query (parse_one before submitting), executed or not, so every
+    # (meta, sql) input must be byte-identical; only the expected-output halves may differ
+    inputs = lambda pairs: [(m, q) for m, q, _ in pairs]  # noqa: E731
+    return inputs(old_pairs) == inputs(new_pairs)
+
+
+def tpcds_independent(fd, path):
+    """True if this file change (outside sqlglot/) cannot influence test_execute_tpcds."""
+    global _TPCDS_BIT
+    if _TPCDS_BIT is None:
+        _TPCDS_BIT = 1 << IDS.index(TPCDS_ID) if TPCDS_ID in IDS else 0
+    if not _TPCDS_BIT or path in TPCDS_DEPS:
+        return False
+    if path in (TPCDS_SQL, TPCH_SQL):
+        return fixture_inputs_unchanged(fd)
+    if path.startswith(TPCDS_DIRS) or os.path.basename(path) in CONFIG_NAMES:
+        return False
+    if path.endswith(".py"):
+        # any Python file is imported into the same pytest process (collection, shared module state):
+        # an edit to it cannot be proven irrelevant to test_execute_tpcds from file-open data alone
+        return False
+    if OPENS.get(path, 0) & _TPCDS_BIT:
+        return False
+    # a directory listing only matters to files that did not exist before (collection scans dirs)
+    if fd.is_new and OPENS.get(dirname(path), 0) & _TPCDS_BIT:
+        return False
+    return path.startswith(("tests/", "docs/")) or path.endswith((".md", ".rst", ".txt"))
+
+
 def fixb_eligible(diffs):
     paths = set()
     for fd in diffs:
+        if fd.binary:
+            return False
         for p in (fd.old, fd.new):
             if p:
                 paths.add(p)
-    return bool(paths) and all(p.startswith("sqlglot/") and not p.startswith("sqlglot/executor/") for p in paths)
+    code = [p for p in paths if p.startswith("sqlglot/")]
+    if any(p.startswith("sqlglot/executor/") for p in code):
+        return False
+    others = [fd for fd in diffs if not all(p.startswith("sqlglot/") for p in (fd.old, fd.new) if p)]
+    if not code and not others:
+        return False
+    return all(tpcds_independent(fd, p) for fd in others for p in (fd.old, fd.new) if p)
 
 
 def fixb_apply(root, diffs):
@@ -704,13 +803,17 @@ def fixb_same(cid, diffs):
     import tempfile
     import time
 
+    if not any(p.startswith("sqlglot/") for fd in diffs for p in (fd.old, fd.new) if p):
+        log("fixb", cid, "SAME (no sqlglot code changed; other files vetted)")
+        return True
     if time.time() - T0 > FIXB_BUDGET_S:
         log("fixb", cid, "skipped: time budget")
         return False
     td = Path(tempfile.mkdtemp(prefix="fixb_", dir="/tmp" if Path("/tmp").is_dir() else None))
     try:
         shutil.copytree(FIXB_PINNED_SRC / "sqlglot", td / "sqlglot")
-        fixb_apply(td, diffs)
+        # only the sqlglot/ part can change the pipeline; the rest was vetted by tpcds_independent()
+        fixb_apply(td, [fd for fd in diffs if all(p.startswith("sqlglot/") for p in (fd.old, fd.new) if p)])
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "/tmp"),
                "PYTHONDONTWRITEBYTECODE": "1"}
         p = subprocess.run([sys.executable, "-S", str(APP / "fixb.py"), str(td), str(FIXB_DATA), "-", str(FIXB_PINNED_FP)],
@@ -768,14 +871,22 @@ def main():
     for patch in sorted((DATA / "commits").glob("*.patch")):
         text = patch.read_text(encoding="utf-8", errors="replace")
         diffs = None
-        NEEDS_IMPORT_CHECK.clear()
         try:
             diffs = parse_patch(text)
-            mask = 0
-            for fd in diffs:
-                mask |= select_file(fd)
-                if mask == ALL:
+            for attempt in (1, 2):
+                VM["enabled"], VM["used"] = attempt == 1, False
+                NEEDS_IMPORT_CHECK.clear()
+                mask = 0
+                for fd in diffs:
+                    mask |= select_file(fd)
+                    if mask == ALL:
+                        break
+                only_proven_py = all(
+                    (fd.old or "").startswith("sqlglot/") and fd.old == fd.new and fd.old.endswith(".py")
+                    and not fd.is_new and not fd.is_deleted and not fd.binary for fd in diffs)
+                if not VM["used"] or (mask == 0 and only_proven_py and not NEEDS_IMPORT_CHECK):
                     break
+                log("valuemap", patch.stem, "not applicable to the whole patch; recomputing without it")
             if mask != ALL and NEEDS_IMPORT_CHECK and not imports_ok(patch.stem, diffs):
                 mask = ALL
         except Exception as e:  # never crash: fall back to everything

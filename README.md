@@ -44,7 +44,16 @@ When a patch touches only `sqlglot/` and not `sqlglot/executor/`, and dropping t
   `fixb_build.py` during the Docker build, with the same Python.
 
 If every fingerprint matches, the test receives identical input and runs on unchanged executor code, so its
-outcome can't change, and the selector drops it. Any difference, exception, timeout or exhausted time budget
+outcome can't change, and the selector drops it.
+
+A patch may also touch files outside `sqlglot/`, but only when none of them can reach the test:
+
+* **No Python files.** Every test module shares the pytest process, so a `.py` edit can't be ruled out.
+* **Not the test's own files:** its module, `tests/helpers.py`, the TPC-DS fixture data, or any configuration file.
+* **Not a file the test was recorded opening.**
+* **`tpc-ds.sql` edits** are re-parsed with an exact copy of the test's fixture parser. Every `(meta, sql)` input
+  must stay byte-identical, because the test parses all of them, not only the executed ones.
+* **`tpc-h.sql` edits** only have to parse. The test's class setup parses that file, but the test never reads it. Any difference, exception, timeout or exhausted time budget
 keeps the test. This is the "run sqlglot's code while you decide" option, and its CPU time is paid for.
 
 ## 3. Function signatures and import-time safety (`impcheck.py`)
@@ -63,6 +72,39 @@ Whenever a patch relies on that rule, or adds, removes or renames any name bound
 `impcheck.py` on a `/tmp` copy of the patched sources. It imports every `sqlglot` module and compares the
 failures with the pinned list, which is computed at Docker build time. If any module imports differently,
 every test is selected.
+
+## 4. Value profile of comparisons (`valuemap.py`, `cmpmap.bin`)
+
+**Map built from the pinned commit.** The full test suite runs on the pinned commit with every
+single-operator comparison in `sqlglot/` instrumented. That includes import and collection time, pytest-xdist
+workers and spawned pool workers. It runs twice, under different hash seeds, and both runs pass all 1620 tests.
+
+For each comparison site, `cmpmap.bin` records what the comparison was evaluated on:
+
+* The distinct operand pairs, with their types, when both operands are plain values (None, bool, int, float,
+  str, or tuples of these).
+* The results under every comparison operator, for Enum operands whose comparison methods aren't defined in
+  sqlglot.
+* Whether two objects with default, identity-based equality were compared.
+* Whether anything unclassifiable was seen, or the value set overflowed. Either makes the site unusable.
+
+This is an execution profile of the pinned code, in the same category as line coverage. It doesn't say which
+tests any edit breaks.
+
+**Runtime.** The check only applies when every change in the patch lies inside comparison nodes of `sqlglot/`
+files, where a comparison's operator changed or one of its literal operands changed. For each changed site, the
+selector re-evaluates the patched comparison on every recorded input and checks that it returns exactly the
+same result as the original.
+
+If every site does, no test can behave differently, by induction:
+
+* Execution is identical up to the first evaluation of a changed site.
+* That evaluation sees operands the profile recorded.
+* So it returns the original result.
+* Execution stays identical from there to the next evaluation, and so on.
+
+The selector then selects nothing. If any site was never recorded, was unsafe, or differs on even one input,
+or the patch changes anything else, the normal selection applies.
 
 ## Validation (not shipped)
 
