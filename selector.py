@@ -1430,7 +1430,7 @@ def main():
         gchecks = [i for i, (cid, numbers, diffs) in enumerate(rows)
                    if diffs is not None and GENMEM_NUM in numbers and len(numbers) < len(dur_ms) - 10
                    and genmem_droppable(diffs)
-                   and cost_ms(numbers) - cost_ms([n for n in numbers if n != GENMEM_NUM]) > 1500]
+                   and cost_ms(numbers) - cost_ms([n for n in numbers if n != GENMEM_NUM]) > 700]  # check ~0.45 s CPU with .pyc
         if gchecks:
             with ThreadPoolExecutor(2) as ex:
                 oks = list(ex.map(lambda i: genmem_cold_ok(rows[i][0], rows[i][2]), gchecks))
