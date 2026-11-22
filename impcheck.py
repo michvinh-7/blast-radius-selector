@@ -20,6 +20,19 @@ for name in mods:
         importlib.import_module(name)
     except BaseException:  # noqa: BLE001 - any failure to import counts
         failed.append(name)
-if len(sys.argv) > 2:
-    sys.exit(0 if failed == json.load(open(sys.argv[2])) else 3)
+if "--generators" in sys.argv:
+    # cold construction (fresh process: _DISPATCH_CACHE empty) of one generator per dialect
+    try:
+        from sqlglot.dialects.dialect import Dialect, Dialects
+
+        for name in Dialects:
+            try:
+                Dialect.get_or_raise(name).generator()
+            except BaseException:  # noqa: BLE001
+                failed.append(f"generator:{name}")
+    except BaseException:  # noqa: BLE001
+        failed.append("generator:*")
+args = [a for a in sys.argv[2:] if not a.startswith("--")]
+if args:
+    sys.exit(0 if failed == json.load(open(args[0])) else 3)
 print(json.dumps(failed))
