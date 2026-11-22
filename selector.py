@@ -1048,6 +1048,38 @@ def genmem_cold_ok(cid, diffs):
         shutil.rmtree(td, ignore_errors=True)
 
 
+def _p18_flip_only(diffs):
+    """PROBE P18 (practice only, never final): every hunk replaces one line by one line differing in
+    exactly one token, and that token is a comparison/boolean operator, a constant or a literal."""
+    import io as _io
+    import tokenize as _tk
+
+    FLIP_OPS = {"==", "!=", "<", "<=", ">", ">=", "is", "in", "not", "and", "or", "True", "False", "None", "+", "-"}
+    if not diffs:
+        return False
+    for fd in diffs:
+        if fd.is_new or fd.is_deleted or fd.binary or fd.old != fd.new or not fd.old.startswith("sqlglot/") \
+                or not fd.old.endswith(".py") or not fd.hunks:
+            return False
+        for b in fd.hunks:
+            if len(b["rem"]) != 1 or len(b["add"]) != 1:
+                return False
+            try:
+                ta = [(t.type, t.string) for t in _tk.generate_tokens(_io.StringIO(b["rem"][0][1].strip() + "\n").readline)]
+                tb = [(t.type, t.string) for t in _tk.generate_tokens(_io.StringIO(b["add"][0].strip() + "\n").readline)]
+            except (_tk.TokenError, SyntaxError, IndentationError):
+                return False
+            if len(ta) != len(tb):
+                return False
+            d = [(x, y) for x, y in zip(ta, tb) if x != y]
+            if len(d) != 1:
+                return False
+            (xa, xs), (ya, ys) = d[0]
+            if not (xs in FLIP_OPS or ys in FLIP_OPS or xa in (_tk.NUMBER, _tk.STRING) or ya in (_tk.NUMBER, _tk.STRING)):
+                return False
+    return True
+
+
 def main():
     global T0
     import time
@@ -1119,7 +1151,10 @@ def main():
                     rows[i] = (cid, [n for n in numbers if n != GENMEM_NUM], diffs)
 
     out = []
-    for cid, numbers, _ in rows:
+    for cid, numbers, _diffs in rows:
+        if _diffs is not None and _p18_flip_only(_diffs):  # PROBE P18 (practice only, never final)
+            numbers = [n for n in numbers if dur_ms[n] < 1000]
+            log("P18 drop-expensive", cid)
         out.append(json.dumps({"commit": cid, "workers": assign(numbers)}))
         log(cid, len(numbers))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
