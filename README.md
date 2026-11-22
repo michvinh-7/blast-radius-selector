@@ -61,6 +61,16 @@ branch, and the Python generator's Boolean rendering. They're listed in `fixb_ex
 touches any of them keeps `test_execute_tpcds`, because the fingerprint can't see those edits. Any difference, exception, timeout or exhausted time budget
 keeps the test. This is the "run sqlglot's code while you decide" option, and its CPU time is paid for.
 
+### TPC-H siblings (`tpchfp.py`)
+
+`test_execute_tpch` executes no query, because no TPC-H fixture entry has the `execute` flag. Its outcome
+depends only on parsing and pickling the 22 TPC-H queries. `test_optimized_tpch` feeds duckdb only the SQL
+that sqlglot generates for each query and for its expected optimized form.
+
+When a patch is eligible under the Fix B rules and doesn't touch the TPC fixtures, `tpchfp.py` recomputes
+those parse and duckdb-SQL fingerprints on the patched sources. A test is dropped only if its fingerprint
+matches the pinned one, which is computed at build time.
+
 ## 3. Function signatures and import-time safety (`impcheck.py`)
 
 A `def` line runs at import, so line coverage credits it to every test that imports sqlglot. Editing a

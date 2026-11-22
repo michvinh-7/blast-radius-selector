@@ -36,3 +36,11 @@ imp = fp.parent / "pinned_imports.json"
 r = subprocess.run([sys.executable, "-S", str(app / "impcheck.py"), str(out_dir)], check=True, capture_output=True, text=True)
 imp.write_text(r.stdout.strip())
 print(f"pinned import failures: {r.stdout.strip()}", file=sys.stderr)
+# TPC-H tests: pinned parse / duckdb-SQL fingerprints, checked twice for determinism
+tp = fp.parent / "pinned_tpch.json"
+for target in (tp, tp.with_suffix(".check.json")):
+    subprocess.run([sys.executable, "-S", str(app / "tpchfp.py"), str(out_dir), str(app / "fixb_tpch.json"), str(target)], check=True)
+if tp.read_bytes() != tp.with_suffix(".check.json").read_bytes():
+    sys.exit("tpch fingerprints are not deterministic")
+tp.with_suffix(".check.json").unlink()
+print(f"pinned tpch fingerprints: {tp}", file=sys.stderr)

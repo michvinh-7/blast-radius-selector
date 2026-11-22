@@ -941,6 +941,52 @@ def imports_ok(cid, diffs):
         shutil.rmtree(td, ignore_errors=True)
 
 
+# TPC-H tests (Fix B's siblings in TestExecutor): neither executes a query, so their outcome depends on
+# the parse/pickle of the 22 TPC-H queries (test_execute_tpch) and the duckdb SQL sqlglot produces for
+# them and their expected optimized forms (test_optimized_tpch), plus class setup, which the Fix B
+# eligibility rules already guard. Any edit to the TPC fixtures keeps both.
+TPCH_IDS = {"tests/test_executor.py::TestExecutor::test_execute_tpch": "parse",
+            "tests/test_executor.py::TestExecutor::test_optimized_tpch": "duck"}
+TPCH_NUMS = {num_by_id[i]: k for i, k in TPCH_IDS.items() if i in num_by_id}
+FIXB_PINNED_TPCH = Path(os.environ.get("FIXB_PINNED_TPCH", APP / "pinned_tpch.json"))
+TPCH_MIN_SAVING_MS = 1500
+
+
+def tpch_eligible(diffs):
+    if any(p.startswith("tests/fixtures/optimizer/tpc-") for fd in diffs for p in (fd.old, fd.new) if p):
+        return False
+    return fixb_eligible(diffs)
+
+
+def tpch_unchanged(cid, diffs):
+    """Set of fingerprint kinds ("parse", "duck") proven unchanged by this patch."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    if not any(p.startswith("sqlglot/") for fd in diffs for p in (fd.old, fd.new) if p):
+        return {"parse", "duck"}  # no sqlglot code changed; other files vetted by tpch_eligible
+    if not (FIXB_PINNED_TPCH.exists() and (FIXB_PINNED_SRC / "sqlglot").is_dir()):
+        log("!!! tpch check disabled: pinned data missing !!!")
+        return set()
+    td = Path(tempfile.mkdtemp(prefix="tpch_", dir="/tmp" if Path("/tmp").is_dir() else None))
+    try:
+        shutil.copytree(FIXB_PINNED_SRC / "sqlglot", td / "sqlglot")
+        fixb_apply(td, [fd for fd in diffs if all(p.startswith("sqlglot/") for p in (fd.old, fd.new) if p)])
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "/tmp"),
+               "PYTHONDONTWRITEBYTECODE": "1"}
+        p = subprocess.run([sys.executable, "-S", str(APP / "tpchfp.py"), str(td), str(APP / "fixb_tpch.json"), "-",
+                            str(FIXB_PINNED_TPCH)], env=env, capture_output=True, text=True, timeout=FIXB_TIMEOUT_S)
+        same = set(p.stdout.split()) if p.returncode == 0 else set()
+        log("tpch", cid, "unchanged:", sorted(same) or "none")
+        return same
+    except Exception as e:
+        log("tpch", cid, "keep:", repr(e)[:200])
+        return set()
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def main():
     global T0
     import time
@@ -997,6 +1043,21 @@ def main():
             if ok:
                 cid, numbers, diffs = rows[i]
                 rows[i] = (cid, [n for n in numbers if n != TPCDS_NUM], diffs)
+
+    if TPCH_NUMS:
+        tchecks = []
+        for i, (cid, numbers, diffs) in enumerate(rows):
+            present = [n for n in numbers if n in TPCH_NUMS]
+            if diffs is None or not present or not tpch_eligible(diffs):
+                continue
+            if cost_ms(numbers) - cost_ms([n for n in numbers if n not in TPCH_NUMS]) > TPCH_MIN_SAVING_MS:
+                tchecks.append(i)
+        if tchecks:
+            with ThreadPoolExecutor(2) as ex:
+                results = list(ex.map(lambda i: tpch_unchanged(rows[i][0], rows[i][2]), tchecks))
+            for i, same in zip(tchecks, results):
+                cid, numbers, diffs = rows[i]
+                rows[i] = (cid, [n for n in numbers if not (n in TPCH_NUMS and TPCH_NUMS[n] in same)], diffs)
 
     out = []
     for cid, numbers, _ in rows:
