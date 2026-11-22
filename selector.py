@@ -1048,6 +1048,187 @@ def genmem_cold_ok(cid, diffs):
         shutil.rmtree(td, ignore_errors=True)
 
 
+# ------------------------------------------------------------------ table-entry narrowing
+# Many patches only edit entries of class-level tables (TRANSFORMS, FUNCTIONS, KEYWORDS, arg_types,
+# SHOW_PARSERS...). Coverage credits a table literal to every test that imported the class, so such
+# a patch selected every user of the class. tabmap.bin (built from the pinned suite with every
+# sqlglot module/class dict replaced by a recording dict) says, per test, which (owner, table, key)
+# it read, and which tables it saw whole (iteration, copy, len...). At decision time tabfp.py
+# fingerprints every table entry and every other module/class attribute of the patched tree; the
+# patch may drop a selected test only if
+#   - every changed line lies inside a class-level table literal and no existing dict key is reordered,
+#   - all modules import as on the pinned tree and NO non-table attribute changed (anything derived
+#     from the edit that is not a table entry - a set, a trie object, a closure - keeps everything),
+#   - the test is tracked (never started a process, never failed while recorded, lives in a file
+#     without cross-test state) and read none of the changed entries and never saw a changed table whole.
+# Anything unexpected keeps the selection unchanged.
+TAB_PATH = APP / "tabmap.bin"
+TAB_PINNED_FP = Path(os.environ.get("TAB_PINNED_FP", APP / "pinned_tabfp.pkl"))
+TAB_MIN_SAVING_MS = 3000
+_TAB = {}
+
+
+def _tab_map():
+    if "m" not in _TAB:
+        d = pickle.loads(zlib.decompress(TAB_PATH.read_bytes()))
+        ids = d["ids"]
+        nums = [num_by_id.get(t) for t in ids]
+        untracked = {nums[i] for i in d["untracked"]} | {n for n in nums if n is None}
+        tracked = {n for n in nums if n is not None} - untracked
+        idx = {oa: {k: frozenset(nums[i] for i in v) for k, v in ks.items()} for oa, ks in d["idx"].items()}
+        _TAB["m"] = (tracked, idx)
+    return _TAB["m"]
+
+
+
+def _dict_key_seq(node):
+    """Source-order dumps of every dict-display key inside node (** entries included)."""
+    import ast
+
+    out = []
+
+    def rec(n):
+        if isinstance(n, ast.Dict):
+            for k, v in zip(n.keys, n.values):
+                out.append(ast.dump(k) if k is not None else "**" + ast.dump(v))
+        for c in ast.iter_child_nodes(n):
+            rec(c)
+
+    rec(node)
+    return out
+
+
+def tables_only(diffs):
+    """Every changed line is inside a class-level table literal (dict/set/list/tuple display or
+    comprehension) of non-test sqlglot code, the file still parses, and no existing dict key moved."""
+    import ast
+    from collections import Counter
+
+    TAB = (ast.Dict, ast.Set, ast.List, ast.Tuple, ast.DictComp, ast.SetComp, ast.ListComp)
+    if not diffs:
+        return False
+    for fd in diffs:
+        if fd.is_new or fd.is_deleted or fd.binary or fd.old != fd.new or not fd.old.startswith("sqlglot/") \
+                or not fd.old.endswith(".py") or not fd.hunks:
+            return False
+        old = read_old(fd.old)
+        if old is None:
+            return False
+        try:
+            t_old = ast.parse("\n".join(old))
+            t_new = ast.parse(apply_blocks(old, fd.hunks))
+        except SyntaxError:
+            return False
+
+        def tables(tree):
+            return [st for c in ast.walk(tree) if isinstance(c, ast.ClassDef) for st in c.body
+                    if isinstance(st, (ast.Assign, ast.AnnAssign)) and isinstance(st.value, TAB)]
+
+        ranges = [(st.lineno, st.end_lineno) for st in tables(t_old)]
+        for b in fd.hunks:
+            lines = [ln for ln, _ in b["rem"]] or [b["pos"] - 1, b["pos"]]
+            if not any(all(lo <= L <= hi for L in lines) for lo, hi in ranges):
+                return False
+        so = [k for st in tables(t_old) for k in _dict_key_seq(st)]
+        sn = [k for st in tables(t_new) for k in _dict_key_seq(st)]
+        common = Counter(so) & Counter(sn)
+
+        def keep(seq):
+            c = Counter(common)
+            r = []
+            for k in seq:
+                if c[k] > 0:
+                    c[k] -= 1
+                    r.append(k)
+            return r
+
+        if keep(so) != keep(sn):
+            return False  # an existing key moved: iteration order could change unseen
+    return True
+
+
+def tab_changes(cid, diffs):
+    """Set of ((owner, attr), key) whose fingerprint differs on the patched tree, or None to keep all."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    if not (TAB_PINNED_FP.exists() and TAB_PATH.exists() and (FIXB_PINNED_SRC / "sqlglot").is_dir()):
+        log("!!! tabmap disabled: pinned data missing !!!")
+        return None
+    td = Path(tempfile.mkdtemp(prefix="tab_", dir="/tmp" if Path("/tmp").is_dir() else None))
+    try:
+        shutil.copytree(FIXB_PINNED_SRC / "sqlglot", td / "sqlglot")
+        fixb_apply(td, diffs)
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "/tmp"),
+               "PYTHONDONTWRITEBYTECODE": "1", "PYTHONHASHSEED": "0"}
+        out = td / "fp.pkl"
+        p = subprocess.run([sys.executable, "-S", str(APP / "tabfp.py"), str(td), str(out)],
+                           env=env, capture_output=True, timeout=FIXB_TIMEOUT_S)
+        if p.returncode != 0:
+            log("tabmap", cid, f"fingerprint failed (exit {p.returncode}) -> keep")
+            return None
+        pat = pickle.loads(out.read_bytes())
+        pin = pickle.loads(TAB_PINNED_FP.read_bytes())
+        if pat["errors"] != pin["errors"] or set(pat["tables"]) != set(pin["tables"]) \
+                or set(pat["other"]) != set(pin["other"]):
+            log("tabmap", cid, "module/table set differs -> keep")
+            return None
+        pin_unk = {(o, a) for o, a, k in pin["unk"] if k is None}
+        if any(k is None and (o, a) not in pin_unk for o, a, k in pat["unk"]):
+            log("tabmap", cid, "new unfingerprintable attribute -> keep")
+            return None
+        mods = {fd.old[:-3].replace("/", ".").removesuffix(".__init__") for fd in diffs}
+
+        def in_patched(owner):
+            return any(owner == m or owner.startswith(m + ".") for m in mods)
+
+        for oa, (s, w) in pat["other"].items():
+            ps, pw = pin["other"][oa]
+            if s == ps and oa not in pin["unstable_other"]:
+                continue
+            # same elements in another order, in a module the patch did not touch, for a sequence of classes
+            # (built from a set, so its order follows memory addresses and differs per process) whose every
+            # use in sqlglot is isinstance(x, NAME) / `in NAME` (weak_ok, checked at build time): order cannot
+            # matter. Added/removed elements change the weak fingerprint; anything else keeps all.
+            if w == pw and oa in pin["weak_ok"] and oa not in pin["unstable_weak"] and not in_patched(oa[0]):
+                continue
+            log("tabmap", cid, "non-table attribute changed", oa, "-> keep")
+            return None
+        changed = set()
+        for oa, t in pat["tables"].items():
+            pt = pin["tables"][oa]
+            for k in set(t) | set(pt):
+                if t.get(k) != pt.get(k) or (oa, k) in pin["unstable_keys"]:
+                    changed.add((oa, k))
+        for o, a, k in pat["unk"] + pin["unk"]:
+            if k is not None:
+                changed.add(((o, a), k))
+        bad = {oa for oa, _ in changed} & pin["aliased"]
+        if bad:
+            log("tabmap", cid, "changed table is referenced outside module/class namespaces", sorted(bad), "-> keep")
+            return None
+        log("tabmap", cid, len(changed), "table entries changed")
+        return changed
+    except Exception as e:
+        log("tabmap", cid, "keep:", repr(e)[:200])
+        return None
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def tab_keep(numbers, changed):
+    tracked, idx = _tab_map()
+    hit = set()
+    tables = {oa for oa, _ in changed}
+    for oa, k in changed:
+        ks = idx.get(oa, {})
+        hit |= ks.get(k, frozenset())
+    for oa in tables:
+        hit |= idx.get(oa, {}).get("*", frozenset())
+    return [n for n in numbers if n not in tracked or n in hit]
+
+
 def main():
     global T0
     import time
@@ -1088,6 +1269,26 @@ def main():
         if mask == ALL:
             numbers = sorted(set(numbers) | set(EXTRA_NUMS))
         rows.append((patch.stem, numbers, diffs))
+
+    # table-entry narrowing (before Fix B / generator memory, which then see the narrowed selection)
+    tchecks = []
+    if TAB_PATH.exists():
+        tracked, _ = _tab_map()
+        for i, (cid, numbers, diffs) in enumerate(rows):
+            if diffs is None or not numbers or len(numbers) >= len(dur_ms) - 10 or not tables_only(diffs):
+                continue
+            floor = cost_ms([n for n in numbers if n not in tracked])
+            if cost_ms(numbers) - floor > TAB_MIN_SAVING_MS:
+                tchecks.append(i)
+    if tchecks:
+        with ThreadPoolExecutor(2) as ex:
+            res = list(ex.map(lambda i: tab_changes(rows[i][0], rows[i][2]), tchecks))
+        for i, changed in zip(tchecks, res):
+            if changed is not None:
+                cid, numbers, diffs = rows[i]
+                kept = tab_keep(numbers, changed)
+                log("tabmap", cid, f"{len(numbers)} -> {len(kept)} tests")
+                rows[i] = (cid, kept, diffs)
 
     checks = []
     if fixb_ready:

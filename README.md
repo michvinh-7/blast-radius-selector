@@ -140,3 +140,14 @@ See `tools/`:
 * `iso_plugin.py` runs each test in a forked child with coverage.
 * `classhook.py` records instantiated classes.
 * `build_map.py` assembles `map.bin` and `src.bin`.
+
+## 6. Table-entry narrowing (`tabmap.bin`, `tabfp.py`, `tab_build.py`)
+Patches that only edit entries of class-level table literals (TRANSFORMS, FUNCTIONS, KEYWORDS,
+arg_types, ...) used to select every test of the class. `tools/tabmap/tabrec.py` re-runs the pinned
+suite with every sqlglot module/class dict (and the generator dispatch tables, and process-pool
+tasks) replaced by a recording dict, giving per test the (owner, table, key) entries it read and the
+tables it saw whole. At decision time `tabfp.py` fingerprints every table entry and every other
+module/class attribute of the patched tree and compares with the pinned fingerprint (built in the
+image by `tab_build.py`, with an alias audit). A test is dropped only if it is tracked (no process,
+no failure while recorded, no cross-test state) and read none of the changed entries; any non-table
+change, import difference, aliased table or unknown keeps the selection unchanged.
