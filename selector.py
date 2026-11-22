@@ -954,27 +954,39 @@ GENMEM_NUM = num_by_id.get(GENMEM_ID)
 FIXB_PINNED_IMPORTS_GEN = Path(os.environ.get("FIXB_PINNED_IMPORTS_GEN", APP / "pinned_imports_gen.json"))
 
 
-# files on the per-construction path of test_generator_memory's measured loop (Generator.__init__, the
-# Dialect machinery, tokenizer-derived attributes, and the generators whose __init__ builds other dialects)
+# test_generator_memory's measured window (between tracemalloc.start and stop) executes only the lines in
+# genmem_window.json (traced on the pinned commit under the scorer's Python): Generator.__init__, the
+# dispatch-cache lookup, name_sequence, Dialect.get_or_raise, and the Athena/BigQuery generator __init__s.
+# Everything else this test touches runs once, at import/warm-up, before memory is traced: a change there
+# can only make the test fail by raising, which the cold check (fresh process: import everything, build one
+# generator per dialect) detects. Athena's generator builds Hive and Trino dialects inside the window, so
+# those modules (and the tokenizer machinery, lazy-import packages) always keep the test.
 GENMEM_PATH_FILES = {
-    "sqlglot/generator.py", "sqlglot/dialects/dialect.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py",
-    "sqlglot/helper.py", "sqlglot/generators/athena.py", "sqlglot/dialects/athena.py", "sqlglot/dialects/hive.py",
-    "sqlglot/dialects/trino.py", "sqlglot/generators/hive.py", "sqlglot/generators/trino.py",
-    "sqlglot/generators/bigquery.py", "sqlglot/dialects/__init__.py", "sqlglot/__init__.py",
+    "sqlglot/tokens.py", "sqlglot/tokenizer_core.py", "sqlglot/dialects/__init__.py", "sqlglot/__init__.py",
+    "sqlglot/generators/__init__.py", "sqlglot/generators/athena.py", "sqlglot/dialects/athena.py",
+    "sqlglot/dialects/hive.py", "sqlglot/dialects/trino.py", "sqlglot/generators/hive.py",
+    "sqlglot/generators/trino.py", "sqlglot/generators/presto.py", "sqlglot/dialects/presto.py",
 }
-# attributes Generator.__init__ reads from the dialect (several derived from the tokenizer by the metaclass)
 GENMEM_DENY = {"NORMALIZE_FUNCTIONS", "QUOTE_START", "QUOTE_END", "IDENTIFIER_START", "IDENTIFIER_END",
                "BYTE_START", "BYTE_END", "IDENTIFIER_ESCAPED_SEQUENCES", "STRING_ESCAPES", "QUOTES", "IDENTIFIERS",
-               "BYTE_STRINGS", "tokenizer_class", "generator_class", "parser_class", "Tokenizer", "Generator", "Parser"}
+               "BYTE_STRINGS", "tokenizer_class", "generator_class", "parser_class", "Tokenizer", "Generator", "Parser",
+               "_DISPATCH_CACHE", "_build_dispatch", "name_sequence", "get_or_raise", "__init__", "__new__"}
+_GENMEM_WINDOW = None
 
 
 def genmem_droppable(diffs):
-    """Every change is import-time code (module level or a class body; never inside a function) in a
-    sqlglot file off the construction path, outside any Tokenizer class, not binding a GENMEM_DENY name.
-    Such code runs once at import (the test's warm-up), so with the cold check it cannot change the
-    measured construction loop."""
+    """True if no change can alter test_generator_memory's measured window (see above)."""
     import ast
 
+    global _GENMEM_WINDOW
+    if _GENMEM_WINDOW is None:
+        try:
+            _GENMEM_WINDOW = {k: set(v) for k, v in json.loads((APP / "genmem_window.json").read_text()).items()}
+        except (OSError, ValueError):
+            _GENMEM_WINDOW = {}
+            return False
+    if not _GENMEM_WINDOW:
+        return False
     any_change = False
     for fd in diffs:
         p = fd.old or fd.new
@@ -985,24 +997,23 @@ def genmem_droppable(diffs):
         old = read_old(p)
         if old is None:
             return False
-        text = "\n".join(old)
-        tree = ast.parse(text)
-        funcs, tokenizers, deny = [], [], []
+        win = _GENMEM_WINDOW.get(p, set())
+        tree = ast.parse("\n".join(old))
+        hot_funcs, tokenizers = [], []
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-                body = node.body if isinstance(node.body, list) else [node.body]
-                funcs.append((body[0].lineno, node.end_lineno))
+                lo, hi = node.lineno, node.end_lineno
+                if any(lo <= L <= hi for L in win):
+                    hot_funcs.append((lo, hi))  # a function that runs inside the window: any edit counts
             elif isinstance(node, ast.ClassDef) and node.name == "Tokenizer":
                 tokenizers.append((node.lineno, node.end_lineno))
-            elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                if any(isinstance(x, ast.Name) and x.id in GENMEM_DENY for tg in targets for x in ast.walk(tg)):
-                    deny.append((node.lineno, node.end_lineno))
         for b in fd.hunks:
             any_change = True
             touched = [ln for ln, _ in b["rem"]] or [b["pos"] - 1, b["pos"]]
             for L in touched:
-                if any(lo <= L <= hi for lo, hi in funcs + tokenizers + deny):
+                if L in win or L - 1 in win or L + 1 in win:
+                    return False
+                if any(lo <= L <= hi for lo, hi in hot_funcs + tokenizers):
                     return False
             if any(GENMEM_DENY_RE.search(t) for t in [x for _, x in b["rem"]] + b["add"]):
                 return False
