@@ -111,6 +111,22 @@ If every site does, no test can behave differently, by induction:
 The selector then selects nothing. If any site was never recorded, was unsafe, or differs on even one input,
 or the patch changes anything else, the normal selection applies.
 
+## 5. `test_generator_memory` (6.7 s): only when construction can change
+
+That test builds every dialect's generator 1,100 times and asserts the memory retained by the last 1,000 is
+under 1 KiB. The selector drops it only when all of these hold:
+
+* Every change is import-time code: module level or a class body, never inside a function.
+* The changes are in sqlglot files off the construction path. Excluded files are `generator.py`,
+  `dialects/dialect.py`, the tokenizer modules, `helper.py`, and the Athena/Hive/Trino/BigQuery modules whose
+  `__init__` builds other dialects.
+* No change is inside a `Tokenizer` class (several attributes that construction reads are derived from it).
+* No change binds or mentions an attribute that `Generator.__init__` reads.
+
+Such code runs once, at import, during the test's warm-up and before memory tracing starts. `_build_dispatch`
+only copies `TRANSFORMS`. A cold process on the patched tree imports every module and builds one generator per
+dialect; if anything differs from the pinned run, the test is kept.
+
 ## Validation (not shipped)
 
 The selector was checked against synthetic mutants of the pinned commit, with ground truth from running the

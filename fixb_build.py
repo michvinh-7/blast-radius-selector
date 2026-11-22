@@ -36,3 +36,9 @@ imp = fp.parent / "pinned_imports.json"
 r = subprocess.run([sys.executable, "-S", str(app / "impcheck.py"), str(out_dir)], check=True, capture_output=True, text=True)
 imp.write_text(r.stdout.strip())
 print(f"pinned import failures: {r.stdout.strip()}", file=sys.stderr)
+# generator-memory check: pinned import + cold generator construction failures (expected: none)
+gi = fp.parent / "pinned_imports_gen.json"
+r = subprocess.run([sys.executable, "-S", str(app / "impcheck.py"), str(out_dir), "--generators"], check=True,
+                   capture_output=True, text=True)
+gi.write_text(r.stdout.strip())
+print(f"pinned import+generator failures: {r.stdout.strip()}", file=sys.stderr)

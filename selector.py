@@ -941,6 +941,113 @@ def imports_ok(cid, diffs):
         shutil.rmtree(td, ignore_errors=True)
 
 
+# test_generator_memory builds every dialect's generator 1,100 times and asserts the traced memory
+# growth over the last 1,000 is < 1 KiB. Generator.__init__ reads only Dialect/Tokenizer-derived
+# attributes; a Generator class's own constants (TRANSFORMS, TYPE_MAPPING, flags, ...) are read only by
+# _build_dispatch -- which copies TRANSFORMS and never calls its values, runs once per class during
+# the warm-up, and is cached -- or by generate(), which this test never calls. So a patch whose every
+# change is a constant assignment inside a Generator class body, on lines the test never runs, cannot
+# change the measured loop. Evaluating the changed constants happens at import, so a cold process
+# imports everything and builds one generator per dialect on the patched tree; any difference keeps it.
+GENMEM_ID = "tests/test_generator.py::TestGenerator::test_generator_memory"
+GENMEM_NUM = num_by_id.get(GENMEM_ID)
+FIXB_PINNED_IMPORTS_GEN = Path(os.environ.get("FIXB_PINNED_IMPORTS_GEN", APP / "pinned_imports_gen.json"))
+
+
+# test_generator_memory's measured window (between tracemalloc.start and stop) executes only the lines in
+# genmem_window.json (traced on the pinned commit under the scorer's Python): Generator.__init__, the
+# dispatch-cache lookup, name_sequence, Dialect.get_or_raise, and the Athena/BigQuery generator __init__s.
+# Everything else this test touches runs once, at import/warm-up, before memory is traced: a change there
+# can only make the test fail by raising, which the cold check (fresh process: import everything, build one
+# generator per dialect) detects. Athena's generator builds Hive and Trino dialects inside the window, so
+# those modules (and the tokenizer machinery, lazy-import packages) always keep the test.
+GENMEM_PATH_FILES = {
+    "sqlglot/tokens.py", "sqlglot/tokenizer_core.py", "sqlglot/dialects/__init__.py", "sqlglot/__init__.py",
+    "sqlglot/generators/__init__.py", "sqlglot/generators/athena.py", "sqlglot/dialects/athena.py",
+    "sqlglot/dialects/hive.py", "sqlglot/dialects/trino.py", "sqlglot/generators/hive.py",
+    "sqlglot/generators/trino.py", "sqlglot/generators/presto.py", "sqlglot/dialects/presto.py",
+}
+GENMEM_DENY = {"NORMALIZE_FUNCTIONS", "QUOTE_START", "QUOTE_END", "IDENTIFIER_START", "IDENTIFIER_END",
+               "BYTE_START", "BYTE_END", "IDENTIFIER_ESCAPED_SEQUENCES", "STRING_ESCAPES", "QUOTES", "IDENTIFIERS",
+               "BYTE_STRINGS", "tokenizer_class", "generator_class", "parser_class", "Tokenizer", "Generator", "Parser",
+               "_DISPATCH_CACHE", "_build_dispatch", "name_sequence", "get_or_raise", "__init__", "__new__"}
+_GENMEM_WINDOW = None
+
+
+def genmem_droppable(diffs):
+    """True if no change can alter test_generator_memory's measured window (see above)."""
+    import ast
+
+    global _GENMEM_WINDOW
+    if _GENMEM_WINDOW is None:
+        try:
+            _GENMEM_WINDOW = {k: set(v) for k, v in json.loads((APP / "genmem_window.json").read_text()).items()}
+        except (OSError, ValueError):
+            _GENMEM_WINDOW = {}
+            return False
+    if not _GENMEM_WINDOW:
+        return False
+    any_change = False
+    for fd in diffs:
+        p = fd.old or fd.new
+        if not p or not p.startswith("sqlglot/") or not p.endswith(".py") or p in GENMEM_PATH_FILES:
+            return False
+        if fd.is_new or fd.is_deleted or fd.binary or fd.old != fd.new:
+            return False
+        old = read_old(p)
+        if old is None:
+            return False
+        win = _GENMEM_WINDOW.get(p, set())
+        tree = ast.parse("\n".join(old))
+        hot_funcs, tokenizers = [], []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                lo, hi = node.lineno, node.end_lineno
+                if any(lo <= L <= hi for L in win):
+                    hot_funcs.append((lo, hi))  # a function that runs inside the window: any edit counts
+            elif isinstance(node, ast.ClassDef) and node.name == "Tokenizer":
+                tokenizers.append((node.lineno, node.end_lineno))
+        for b in fd.hunks:
+            any_change = True
+            touched = [ln for ln, _ in b["rem"]] or [b["pos"] - 1, b["pos"]]
+            for L in touched:
+                if L in win or L - 1 in win or L + 1 in win:
+                    return False
+                if any(lo <= L <= hi for lo, hi in hot_funcs + tokenizers):
+                    return False
+            if any(GENMEM_DENY_RE.search(t) for t in [x for _, x in b["rem"]] + b["add"]):
+                return False
+    return any_change
+
+
+GENMEM_DENY_RE = re.compile(r"\b(" + "|".join(sorted(GENMEM_DENY)) + r")\b")
+
+
+def genmem_cold_ok(cid, diffs):
+    import shutil
+    import subprocess
+    import tempfile
+
+    if not (FIXB_PINNED_IMPORTS_GEN.exists() and (FIXB_PINNED_SRC / "sqlglot").is_dir()):
+        log("!!! genmem check disabled: pinned data missing !!!")
+        return False
+    td = Path(tempfile.mkdtemp(prefix="gm_", dir="/tmp" if Path("/tmp").is_dir() else None))
+    try:
+        shutil.copytree(FIXB_PINNED_SRC / "sqlglot", td / "sqlglot")
+        fixb_apply(td, diffs)
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "/tmp"),
+               "PYTHONDONTWRITEBYTECODE": "1"}
+        p = subprocess.run([sys.executable, "-S", str(APP / "impcheck.py"), str(td), "--generators",
+                            str(FIXB_PINNED_IMPORTS_GEN)], env=env, capture_output=True, timeout=FIXB_TIMEOUT_S)
+        log("genmem", cid, "cold check ok -> drop" if p.returncode == 0 else f"cold check differs (exit {p.returncode}) -> keep")
+        return p.returncode == 0
+    except Exception as e:
+        log("genmem", cid, "keep:", repr(e)[:200])
+        return False
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def main():
     global T0
     import time
@@ -997,6 +1104,19 @@ def main():
             if ok:
                 cid, numbers, diffs = rows[i]
                 rows[i] = (cid, [n for n in numbers if n != TPCDS_NUM], diffs)
+
+    if GENMEM_NUM is not None:
+        gchecks = [i for i, (cid, numbers, diffs) in enumerate(rows)
+                   if diffs is not None and GENMEM_NUM in numbers and len(numbers) < len(dur_ms) - 10
+                   and genmem_droppable(diffs)
+                   and cost_ms(numbers) - cost_ms([n for n in numbers if n != GENMEM_NUM]) > 1500]
+        if gchecks:
+            with ThreadPoolExecutor(2) as ex:
+                oks = list(ex.map(lambda i: genmem_cold_ok(rows[i][0], rows[i][2]), gchecks))
+            for i, ok in zip(gchecks, oks):
+                if ok:
+                    cid, numbers, diffs = rows[i]
+                    rows[i] = (cid, [n for n in numbers if n != GENMEM_NUM], diffs)
 
     out = []
     for cid, numbers, _ in rows:
