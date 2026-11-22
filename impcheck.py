@@ -1,10 +1,22 @@
 """Import every module of the sqlglot package at ROOT; print the sorted list of modules that fail.
   python -S impcheck.py ROOT [PINNED.json]
 With PINNED.json (the failures on the pinned tree): exit 0 if the failures are identical, else 3."""
+import gc; gc.set_threshold(100000, 50, 100)  # short-lived process: collect cyclic garbage rarely (CPU is scored)
 import importlib
 import json
+import os
 import pkgutil
 import sys
+
+
+def _fastexit(code):
+    # skip interpreter teardown (a full GC + finalizers): CPU is scored
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
+
+
+
 
 root = sys.argv[1]
 sys.path.insert(0, root)
@@ -14,7 +26,7 @@ try:
     mods = sorted(m.name for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot.") if not m.name.endswith("__main__"))
 except Exception:
     print(json.dumps(["sqlglot"]))
-    sys.exit(3)
+    _fastexit(3)
 for name in mods:
     try:
         importlib.import_module(name)
@@ -34,5 +46,6 @@ if "--generators" in sys.argv:
         failed.append("generator:*")
 args = [a for a in sys.argv[2:] if not a.startswith("--")]
 if args:
-    sys.exit(0 if failed == json.load(open(args[0])) else 3)
+    _fastexit(0 if failed == json.load(open(args[0])) else 3)
 print(json.dumps(failed))
+_fastexit(0)
