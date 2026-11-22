@@ -53,7 +53,12 @@ A patch may also touch files outside `sqlglot/`, but only when none of them can 
 * **Not a file the test was recorded opening.**
 * **`tpc-ds.sql` edits** are re-parsed with an exact copy of the test's fixture parser. Every `(meta, sql)` input
   must stay byte-identical, because the test parses all of them, not only the executed ones.
-* **`tpc-h.sql` edits** only have to parse. The test's class setup parses that file, but the test never reads it. Any difference, exception, timeout or exhausted time budget
+* **`tpc-h.sql` edits** only have to parse. The test's class setup parses that file, but the test never reads it.
+
+A trace of the pinned commit found 18 lines outside `sqlglot/executor/` that run while the queries execute but
+never in the fingerprinted pipeline: `find_tables`, `Schema.table_parts`/`find`, `Plan.leaves`, one generator
+branch, and the Python generator's Boolean rendering. They're listed in `fixb_exec_only.json`. A patch that
+touches any of them keeps `test_execute_tpcds`, because the fingerprint can't see those edits. Any difference, exception, timeout or exhausted time budget
 keeps the test. This is the "run sqlglot's code while you decide" option, and its CPU time is paid for.
 
 ## 3. Function signatures and import-time safety (`impcheck.py`)
