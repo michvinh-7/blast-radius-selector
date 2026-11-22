@@ -648,6 +648,15 @@ def _plain_classes():
     return _PLAIN
 
 
+def _source_readers(path):
+    """Tests that read this file's source text (e.g. test_typing parses sqlglot/typing/*.py and
+    compares code objects): an insertion changes what they read, whatever runs."""
+    m = OPENS.get(path, 0)
+    if path.startswith("sqlglot/typing/"):
+        m |= tests_of_file("tests/test_typing.py")
+    return m
+
+
 def _new_to_old(old_n, blocks):
     """new line number -> old line number (None for added lines), 1-based, index 0 unused."""
     m = [None]
@@ -819,7 +828,7 @@ def narrow_insertion(ch, path, old, new_text, blocks, b):
                 return None  # the sibling was edited too: use the general rule
             m |= ch.run_union(n2o[lo], n2o[hi]) | ch.col_union(n2o[lo], n2o[hi])
         log("insertion", path, f"inside a function: tests that reach new lines {n0}-{n1}")
-        return m
+        return m | _source_readers(path)
     if isinstance(scope, (ast.Module, ast.ClassDef)) and owner is scope and field == "body":
         # rule (2)
         if isinstance(scope, ast.ClassDef):
@@ -867,7 +876,7 @@ def narrow_insertion(ch, path, old, new_text, blocks, b):
                 return None
         NEEDS_IMPORT_CHECK.add(path)
         log("insertion", path, "new definitions no pinned code or test mentions:", sorted(names))
-        return 0
+        return _source_readers(path)
     return None
 
 
